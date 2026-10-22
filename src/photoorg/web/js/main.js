@@ -61,7 +61,8 @@ const gallery = new Gallery(galleryView, main, {
       reveal: (e) => gallery.reveal(indexOf.get(e)),
     }, { removeWhen: (e) => e.excluded });
   },
-  onSelect: (items) => renderSelectionBar(items),
+  onSelect: (items, { mode }) => renderSelectionBar(items, mode),
+  bottomInset: () => ($('#selbar').hidden ? 0 : $('#selbar').offsetHeight + 22),
   onSearch: (query) => {
     galleryQuery = query;
     galleryScroll = 0;
@@ -119,7 +120,7 @@ const emptyArchive = () => `<div class="empty">
     <button class="btn btn-primary" type="button" data-action="scan">${icon('i-refresh')}Aggiorna archivio</button>
   </div></div>`;
 
-async function loadGallery() {
+async function loadGallery({ keep = false } = {}) {
   galleryUser = ctx.user;
   galleryStale = false;
   lightbox.invalidate();
@@ -131,7 +132,7 @@ async function loadGallery() {
     const { items } = await api.get(`/api/search?${q({ user: ctx.user, q: galleryQuery })}`);
     gallery.entries = toEntries(items);
     if (items.length) {
-      gallery.setData(items, { results: `${plural(items.length, 'risultato', 'risultati')} per «${galleryQuery}»`, query: galleryQuery });
+      gallery.setData(items, { results: `${plural(items.length, 'risultato', 'risultati')} per «${galleryQuery}»`, query: galleryQuery, keep });
     } else {
       gallery.empty(`<div class="empty"><h2>Nessun risultato</h2>
         <p>Nessuna foto corrisponde a «${esc(galleryQuery)}». Prova con un luogo, una persona, un oggetto o un momento, per esempio “mare”, “compleanno”, “neve”.</p></div>`,
@@ -141,18 +142,22 @@ async function loadGallery() {
   }
   const { items } = await api.get(`/api/timeline?${q({ user: ctx.user })}`);
   gallery.entries = toEntries(items);
-  if (items.length) gallery.setData(items); else gallery.empty(emptyArchive());
+  if (items.length) gallery.setData(items, { keep }); else gallery.empty(emptyArchive());
 }
 
-/** Reload after edits, keeping the scroll position. */
+/** Reload after edits, keeping the scroll position, the selection and the cursor. */
 async function reloadGallery() {
   const visible = ctx.current === 'galleria';
-  const keep = visible ? main.scrollTop : galleryScroll;
-  await loadGallery();
-  if (visible) { gallery.shown(); main.scrollTop = keep; } else galleryScroll = keep;
+  const scroll = visible ? main.scrollTop : galleryScroll;
+  await loadGallery({ keep: true });
+  if (visible) { gallery.shown(); main.scrollTop = scroll; } else galleryScroll = scroll;
 }
 
-lightbox.onClose = () => { if (galleryStale && ctx.current === 'galleria') reloadGallery(); };
+lightbox.onClose = () => {
+  if (ctx.current !== 'galleria') return;
+  gallery.focusCursor();
+  if (galleryStale) reloadGallery();
+};
 lightbox.onSearch = (query) => ctx.searchFor(query);
 lightbox.onChange = (change) => {
   if (change.error) { toast(change.error); return; }
@@ -178,22 +183,31 @@ lightbox.onChange = (change) => {
 
 // ---------- selection bar ----------
 
-function renderSelectionBar(items) {
+function renderSelectionBar(items, mode) {
   const bar = $('#selbar');
-  bar.hidden = !items.length;
-  if (!items.length) return;
+  bar.hidden = !items.length && !mode;
+  if (bar.hidden) return;
+  if (!items.length) {
+    bar.innerHTML = `
+      <span class="count-label hint-label">Clicca le foto o trascina un’area per selezionarle</span>
+      <button class="btn btn-quiet" type="button" data-sel="all" title="Seleziona tutto (Ctrl+A)">Tutte</button>
+      <button class="btn btn-quiet" type="button" data-action="keys" title="Scorciatoie da tastiera (?)">${icon('i-keyboard')}Tastiera</button>
+      <button class="btn" type="button" data-sel="done" title="Esci dalla selezione (Esc)">Fine</button>`;
+    return;
+  }
   const allFav = items.every((it) => it.f);
   bar.innerHTML = `
     <span class="count-label">${plural(items.length, 'selezionata', 'selezionate')}</span>
-    <button class="btn" type="button" data-sel="fav">${icon('i-star')}${allFav ? 'Togli preferite' : 'Preferite'}</button>
+    <button class="btn" type="button" data-sel="fav" title="Preferite (F)">${icon('i-star')}${allFav ? 'Togli preferite' : 'Preferite'}</button>
     <button class="btn" type="button" data-sel="album">${icon('i-album')}Album</button>
     <button class="btn" type="button" data-sel="person">${icon('i-person')}Persone</button>
     <button class="btn" type="button" data-sel="keyword">${icon('i-tag')}Etichette</button>
     <button class="btn" type="button" data-sel="date">${icon('i-calendar')}Data</button>
     <span class="divider"></span>
-    <button class="btn danger" type="button" data-sel="exclude">${icon('i-trash')}Escludi</button>
+    <button class="btn danger" type="button" data-sel="exclude" title="Metti nel cestino (Canc)">${icon('i-trash')}Escludi</button>
     <button class="btn btn-quiet" type="button" data-sel="all" title="Seleziona tutto (Ctrl+A)">Tutte</button>
-    <button class="btn btn-quiet" type="button" data-sel="clear" aria-label="Annulla la selezione (Esc)">${icon('i-close')}</button>`;
+    <button class="btn btn-quiet" type="button" data-sel="invert" title="Inverti la selezione (Ctrl+I)">Inverti</button>
+    <button class="btn btn-quiet" type="button" data-sel="done" title="Annulla la selezione (Esc)" aria-label="Annulla la selezione">${icon('i-close')}</button>`;
 }
 
 const TAG_DIALOG = {
@@ -202,12 +216,17 @@ const TAG_DIALOG = {
   keyword: { title: 'Aggiungi etichette', label: 'Etichette', hint: 'Per esempio: mare, compleanno. Separa con una virgola.', confirm: 'Aggiungi' },
 };
 
-$('#selbar').addEventListener('click', async (e) => {
+$('#selbar').addEventListener('click', (e) => {
   const action = e.target.closest('[data-sel]')?.dataset.sel;
-  if (!action) return;
-  if (action === 'clear') { gallery.clearSelection(); return; }
-  if (action === 'all') { gallery.selectAll(); return; }
-  const items = gallery.selection();
+  if (action === 'done') gallery.exitSelection();
+  else if (action === 'all') gallery.selectAll();
+  else if (action === 'invert') gallery.invertSelection();
+  else if (action) runAction(action, gallery.selection());
+});
+
+/** An edit on photos of the gallery: from the selection bar, or a key on the selection / the cursor. */
+async function runAction(action, items) {
+  if (!items.length) return;
   const ids = items.map((it) => it.a);
   const n = plural(ids.length, 'foto', 'foto');
   try {
@@ -243,7 +262,12 @@ $('#selbar').addEventListener('click', async (e) => {
   } catch (err) {
     toast(err.message);
   }
-});
+}
+
+function showKeys() {
+  const d = $('#keys');
+  if (!d.open) d.showModal();
+}
 
 // ---------- dialog ----------
 
@@ -299,7 +323,7 @@ async function route() {
   }
   if (ctx.current === 'galleria' && name !== 'galleria') {
     galleryScroll = main.scrollTop;
-    gallery.clearSelection();
+    gallery.exitSelection();
   }
   ctx.leaveHandlers.splice(0).forEach((fn) => fn());
   ctx.current = name;
@@ -396,15 +420,21 @@ document.addEventListener('click', (e) => {
   const action = e.target.closest('[data-action]')?.dataset.action;
   if (action === 'scan') startScan();
   if (action === 'open-income') api.post('/api/open-income').catch((err) => toast(err.message));
+  if (action === 'keys') showKeys();
 });
 $('#scan-btn').addEventListener('click', startScan);
 
 document.addEventListener('keydown', (e) => {
-  if (!lightbox.el.hidden || $('#sheet').open || e.target.closest('input, textarea, select')) return;
+  if (!lightbox.el.hidden || $('#sheet').open || $('#keys').open || e.target.closest('input, textarea, select')) return;
   if (ctx.current !== 'galleria') return;
-  if (e.key === 'Escape' && gallery.selected.size) gallery.clearSelection();
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') { e.preventDefault(); gallery.selectAll(); }
-  if (e.key === 'Delete' && gallery.selected.size) $('#selbar [data-sel="exclude"]')?.click();
+  const plain = !e.ctrlKey && !e.metaKey && !e.altKey;
+  if (plain && e.key === '?') { e.preventDefault(); showKeys(); return; }
+  if (plain && (e.key === 'Delete' || e.key.toLowerCase() === 'f')) {
+    e.preventDefault();
+    if (!e.repeat) runAction(e.key === 'Delete' ? 'exclude' : 'fav', gallery.targets());
+    return;
+  }
+  gallery.onKey(e);
 });
 
 $('#apply-btn').addEventListener('click', async (e) => {

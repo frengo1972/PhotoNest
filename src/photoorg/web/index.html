@@ -38,6 +38,9 @@
     <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="4" y="5.5" width="16" height="14.5" rx="2"/><path d="M4 10h16M8.5 3.5v4M15.5 3.5v4"/></symbol>
     <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
     <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="7" height="6" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="6" rx="1.5"/><path d="M13.5 6h7M13.5 9h4.5M13.5 15h7M13.5 18h4.5"/></symbol>
+    <symbol id="i-select" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="m8.2 12.2 2.6 2.6 5-5.3"/></symbol>
+    <symbol id="i-keyboard" viewBox="0 0 24 24"><rect x="2.5" y="6" width="19" height="12" rx="2.5"/><path d="M6 9.5h.01M9 9.5h.01M12 9.5h.01M15 9.5h.01M18 9.5h.01M6.5 12.5h.01M17.5 12.5h.01M8.5 15h7"/></symbol>
     <symbol id="i-split" viewBox="0 0 24 24"><path d="M7 4v6a2 2 0 0 0 2 2h6a2 2 0 0 1 2 2v6"/><path d="M17 4v4M7 16v4"/></symbol>
   </defs>
 </svg>
@@ -91,6 +94,62 @@
     <div class="sheet-actions">
       <button class="btn btn-quiet" type="submit" value="cancel">Annulla</button>
       <button class="btn btn-primary" type="submit" value="ok"></button>
+    </div>
+  </form>
+</dialog>
+
+<dialog class="sheet keys" id="keys" aria-labelledby="keys-title">
+  <form method="dialog">
+    <h2 id="keys-title">Scorciatoie della galleria</h2>
+    <div class="keys-grid">
+      <div>
+      <section>
+        <h3>Muoversi</h3>
+        <dl>
+          <dt><kbd>←</kbd><kbd>→</kbd><kbd>↑</kbd><kbd>↓</kbd></dt><dd>Sposta il cursore tra le foto</dd>
+          <dt><kbd>Pag↑</kbd><kbd>Pag↓</kbd></dt><dd>Una schermata su o giù</dd>
+          <dt><kbd>Home</kbd><kbd>Fine</kbd></dt><dd>Prima o ultima foto</dd>
+          <dt><kbd>Invio</kbd></dt><dd>Apri la foto</dd>
+          <dt><kbd>/</kbd></dt><dd>Cerca</dd>
+        </dl>
+      </section>
+      <section>
+        <h3>Azioni</h3>
+        <dl>
+          <dt><kbd>F</kbd></dt><dd>Preferita</dd>
+          <dt><kbd>Canc</kbd></dt><dd>Metti nel cestino</dd>
+        </dl>
+        <p class="keys-note">Valgono per le foto selezionate o, se non ce ne sono, per quella sotto il cursore.</p>
+      </section>
+      <section>
+        <h3>Vista</h3>
+        <dl>
+          <dt><kbd>G</kbd> · <kbd>D</kbd></dt><dd>Griglia · Dettagli</dd>
+          <dt><kbd>+</kbd> <kbd>−</kbd></dt><dd>Anteprime più grandi o più piccole</dd>
+          <dt><kbd>?</kbd></dt><dd>Questo riepilogo</dd>
+        </dl>
+      </section>
+      </div>
+      <div>
+      <section>
+        <h3>Selezionare</h3>
+        <dl>
+          <dt><kbd>Spazio</kbd></dt><dd>Seleziona o deseleziona la foto</dd>
+          <dt><kbd>Maiusc</kbd> + frecce</dt><dd>Estendi la selezione</dd>
+          <dt><kbd>Ctrl</kbd> + clic</dt><dd>Aggiungi o togli una foto</dd>
+          <dt><kbd>Maiusc</kbd> + clic</dt><dd>Seleziona fino a questa foto</dd>
+          <dt>Trascina</dt><dd>Seleziona un’area</dd>
+          <dt><kbd>Maiusc</kbd> + trascina</dt><dd>Aggiungi un’area</dd>
+          <dt><kbd>Ctrl</kbd> + trascina</dt><dd>Inverti dentro l’area</dd>
+          <dt><kbd>S</kbd></dt><dd>Modalità selezione: il clic seleziona</dd>
+          <dt><kbd>Ctrl</kbd> <kbd>A</kbd> · <kbd>Ctrl</kbd> <kbd>I</kbd></dt><dd>Tutte · Inverti</dd>
+          <dt><kbd>Esc</kbd></dt><dd>Annulla la selezione</dd>
+        </dl>
+      </section>
+      </div>
+    </div>
+    <div class="sheet-actions">
+      <button class="btn btn-primary" type="submit" value="ok">Chiudi</button>
     </div>
   </form>
 </dialog>

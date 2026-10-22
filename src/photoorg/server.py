@@ -222,6 +222,10 @@ class TagEdit(BaseModel):
     remove: list[str] = []
 
 
+class AssetIds(BaseModel):
+    ids: list[int]
+
+
 class VariantKeep(BaseModel):
     group: int
     keep: list[int]
@@ -424,6 +428,44 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
             "albums": albums, "people": people, "keywords": keywords, "variants": variants, "items": items,
             "auto_tags": auto, "event": dict(event) if event else None,
         }
+
+    @app.post("/api/assets/details")
+    def assets_details(body: AssetIds) -> dict:
+        """Facts shown next to each photo in the gallery's details view, for a batch of assets."""
+        ids = body.ids[:2000]
+        if not ids:
+            return {"details": {}}
+        marks = ",".join("?" * len(ids))
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT a.id, a.tz_offset_min, a.lat, a.lon, a.date_source, a.date_conf, a.date_manual, a.description, "
+                "i.filename, i.size, i.make, i.model, i.sha256, s.type AS source_type "
+                f"FROM assets a JOIN items i ON i.id = a.winner_id JOIN sources s ON s.id = i.source_id WHERE a.id IN ({marks})",
+                ids).fetchall()
+
+            def grouped(sql: str, keys: list) -> dict:
+                out: dict = {}
+                for key, value in conn.execute(sql, keys):
+                    out.setdefault(key, []).append(value)
+                return out
+
+            albums = grouped(f"SELECT asset_id, album FROM asset_albums WHERE asset_id IN ({marks}) ORDER BY album", ids)
+            people = grouped(f"SELECT asset_id, name FROM asset_people WHERE asset_id IN ({marks}) ORDER BY name", ids)
+            keywords = grouped(f"SELECT asset_id, name FROM asset_keywords WHERE asset_id IN ({marks}) ORDER BY name", ids)
+            event = dict(conn.execute(
+                "SELECT ea.asset_id, e.name FROM event_assets ea JOIN events e ON e.id = ea.event_id "
+                f"WHERE ea.asset_id IN ({marks})", ids).fetchall())
+            shas = sorted({r["sha256"] for r in rows if r["sha256"]})
+            auto = grouped(
+                f"SELECT sha256, tag FROM auto_tags WHERE sha256 IN ({','.join('?' * len(shas))}) ORDER BY score DESC",
+                shas) if shas else {}
+        return {"details": {r["id"]: {
+            "tz": r["tz_offset_min"], "lat": r["lat"], "lon": r["lon"], "date_source": r["date_source"],
+            "date_conf": r["date_conf"], "manual": bool(r["date_manual"]), "description": r["description"],
+            "file": r["filename"], "size": r["size"], "make": r["make"], "model": r["model"], "source": r["source_type"],
+            "albums": albums.get(r["id"], []), "people": people.get(r["id"], []), "keywords": keywords.get(r["id"], []),
+            "auto": auto.get(r["sha256"], [])[:8], "event": event.get(r["id"]),
+        } for r in rows}}
 
     # ---------- duplicates, variants, issues ----------
 

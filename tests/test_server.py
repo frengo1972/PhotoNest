@@ -64,6 +64,12 @@ def test_scan_and_browse(client):
     detail = client.get(f"/api/asset/{img1['a']}").json()
     assert detail["n_items"] == 2 and len(detail["items"]) == 2
 
+    details = client.post("/api/assets/details", json={"ids": [i["a"] for i in items]}).json()["details"]
+    assert set(details) == {str(i["a"]) for i in items}
+    assert details[str(img1["a"])]["file"] == "IMG_1.jpg" and details[str(img1["a"])]["source"] == "android"
+    assert details[str(img1["a"])]["albums"] == [] and details[str(img1["a"])]["model"] == "TEST-CAM"
+    assert client.post("/api/assets/details", json={"ids": []}).json() == {"details": {}}
+
     thumb = client.get(f"/media/thumb/{img1['i']}")
     assert thumb.status_code == 200 and thumb.headers["content-type"] == "image/jpeg"
     assert "immutable" in thumb.headers["cache-control"]
