@@ -29,12 +29,15 @@ Chiusa la finestra, il server locale si spegne da solo dopo qualche minuto.
 | Schermata | Cosa fa |
 |---|---|
 | Panoramica | i passi da fare, con quanti elementi restano per ciascuno |
-| Galleria | foto per giorno; − / + o Ctrl+rotellina per la dimensione delle anteprime; clic = visualizzatore |
+| Galleria | foto per giorno; − / + o Ctrl+rotellina per la dimensione delle anteprime; **Cerca** a parole ("mare", "bambini con la torta", un nome); clic = visualizzatore |
+| Eventi | foto raggruppate per tempo e luogo; il nome diventa la cartella sul NAS |
+| Persone | volti riconosciuti e raggruppati sul PC; *Chi è?* dà il nome a tutte le foto del gruppo |
 | Duplicati | confronto affiancato delle copie; *Tieni questa*, *Non è un duplicato*, *Va bene così*, poi *Applica* |
 | Raffiche | scatti nello stesso secondo: *Tieni solo questa* (la più nitida è segnata) o *Tienile tutte* |
 | Date da verificare | date incoerenti o mancanti, con la spiegazione; correzione sul posto |
 | Cestino | foto escluse dall'archivio, *Rimetti* per recuperarle |
 | Fonti | account e telefoni letti, avanzamento dell'aggiornamento, cartella income |
+| Archivio NAS | destinazione (salvata, per ora `X:\ArchivioFoto`), anteprima di cosa farà, *Crea/Aggiorna l'archivio* |
 
 **Azioni** — nessuna tocca gli originali in income; "escludere" significa non copiare nell'archivio finale.
 

@@ -136,6 +136,36 @@ def _export(job: Job, work: Path, root: str, library: Library) -> None:
         export.run(conn, root, library, log=job.log, progress=job.progress)
 
 
+def _analyze(job: Job, work: Path, library: Library) -> None:
+    from photoorg.ai import pipeline  # heavy imports only when the analysis runs
+
+    with closing(catalog.connect(work)) as conn:
+        pipeline.run(conn, library, log=job.log, progress=job.progress, phase=job.set_phase)
+
+
+FACE_PX = 200
+
+
+def _face_crop(library: Library, row: sqlite3.Row, face: sqlite3.Row) -> bytes:
+    """Square crop around a face (with some margin), upright, as JPEG."""
+    import io
+
+    from PIL import Image, ImageOps
+
+    with library.open(row) as f:
+        im = Image.open(io.BytesIO(f.read()))
+        im.draft("RGB", (1600, 1600))
+        im = ImageOps.exif_transpose(im).convert("RGB")
+    w, h = im.size
+    cx, cy = (face["x"] + face["w"] / 2) * w, (face["y"] + face["h"] / 2) * h
+    side = max(face["w"] * w, face["h"] * h) * 1.6
+    box = (max(0, cx - side / 2), max(0, cy - side / 2), min(w, cx + side / 2), min(h, cy + side / 2))
+    crop = im.crop(tuple(round(v) for v in box)).resize((FACE_PX, FACE_PX), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    crop.save(buf, "JPEG", quality=85)
+    return buf.getvalue()
+
+
 PICK_FOLDER = (  # runs in its own process: Tk must own its thread
     "import sys, tkinter as tk\nfrom tkinter import filedialog\n"
     "r = tk.Tk(); r.withdraw(); r.attributes('-topmost', True)\n"
@@ -204,6 +234,11 @@ class EventRename(BaseModel):
     name: str | None = None
 
 
+class FaceName(BaseModel):
+    faces: list[int]
+    name: str
+
+
 class Decision(BaseModel):
     sha: str
     action: str
@@ -255,6 +290,10 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
                 f"SELECT count(*) FROM ({VARIANT_GROUPS} HAVING {VARIANT_TODO})", (user,)
             ).fetchone()[0]
             n_events = conn.execute("SELECT count(*) FROM events WHERE user = ?", (user,)).fetchone()[0]
+            face_groups = conn.execute(
+                "SELECT count(DISTINCT f.cluster) FROM faces f JOIN items i ON i.sha256 = f.sha256 "
+                "JOIN assets a ON a.winner_id = i.id WHERE a.user = ? AND a.excluded = 0 AND f.rejected = 0 "
+                "AND f.person IS NULL AND f.cluster IS NOT NULL", (user,)).fetchone()[0]
             sources = [dict(r) for r in conn.execute(
                 "SELECT s.id, s.user, s.type, s.ident, count(i.id) items, coalesce(sum(i.kind = 'image'), 0) photos, "
                 "coalesce(sum(i.kind = 'video'), 0) videos, coalesce(sum(i.kind = 'raw'), 0) raw, "
@@ -267,7 +306,8 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
         pending = [{"user": s.user, "type": s.type, "ident": s.ident} for s in found if (s.user, s.type, s.ident) not in known]
         return {
             "users": users, "user": user,
-            "counts": {**dict(counts), "issues": issues, "variants_todo": variants_todo, "events": n_events},
+            "counts": {**dict(counts), "issues": issues, "variants_todo": variants_todo, "events": n_events,
+                       "face_groups": face_groups},
             "sources": sources, "pending": pending, "warnings": warnings,
             "income": str(income.resolve()), "job": job.snapshot(),
         }
@@ -347,6 +387,11 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
             albums = [r[0] for r in conn.execute("SELECT album FROM asset_albums WHERE asset_id = ? ORDER BY album", (asset_id,))]
             people = [r[0] for r in conn.execute("SELECT name FROM asset_people WHERE asset_id = ? ORDER BY name", (asset_id,))]
             keywords = [r[0] for r in conn.execute("SELECT name FROM asset_keywords WHERE asset_id = ? ORDER BY name", (asset_id,))]
+            winner_sha = conn.execute("SELECT sha256 FROM items WHERE id = ?", (a["winner_id"],)).fetchone()[0]
+            auto = [r[0] for r in conn.execute("SELECT tag FROM auto_tags WHERE sha256 = ? ORDER BY score DESC", (winner_sha,))]
+            event = conn.execute(
+                "SELECT e.id, e.name FROM event_assets ea JOIN events e ON e.id = ea.event_id WHERE ea.asset_id = ?",
+                (asset_id,)).fetchone()
             variants = (
                 conn.execute("SELECT count(*) FROM assets WHERE variant_group = ?", (a["variant_group"],)).fetchone()[0]
                 if a["variant_group"] else 0
@@ -354,6 +399,7 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
         return {
             **{k: a[k] for k in a.keys()}, "flags": a["flags"].split(",") if a["flags"] else [],
             "albums": albums, "people": people, "keywords": keywords, "variants": variants, "items": items,
+            "auto_tags": auto, "event": dict(event) if event else None,
         }
 
     # ---------- duplicates, variants, issues ----------
@@ -529,6 +575,113 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
             raise HTTPException(404, "cartella dell’archivio non disponibile")
         os.startfile(root)  # noqa: S606 - folder chosen by the user
         return {"ok": True}
+
+    # ---------- local AI: analysis, people, search ----------
+
+    @app.get("/api/ai")
+    def ai_status() -> dict:
+        from photoorg.ai import pipeline
+
+        with db() as conn:
+            return pipeline.status(conn)
+
+    @app.post("/api/ai/analyze")
+    def ai_analyze() -> dict:
+        if not job.start(lambda j: _analyze(j, work, library)):
+            raise HTTPException(409, "un’operazione è già in corso")
+        return job.snapshot()
+
+    @app.get("/api/people")
+    def people(user: str) -> dict:
+        with db() as conn:
+            faces = conn.execute(
+                "SELECT DISTINCT f.id, f.person, f.cluster, f.suggested, f.score, f.w * f.h AS area, a.id AS asset "
+                "FROM faces f JOIN items i ON i.sha256 = f.sha256 JOIN assets a ON a.winner_id = i.id "
+                "WHERE a.user = ? AND a.excluded = 0 AND f.rejected = 0 ORDER BY f.score * f.w DESC", (user,)
+            ).fetchall()
+            tagged = dict(conn.execute(
+                "SELECT p.name, count(DISTINCT p.asset_id) FROM asset_people p JOIN assets a ON a.id = p.asset_id "
+                "WHERE a.user = ? AND a.excluded = 0 GROUP BY p.name", (user,)).fetchall())
+        named: dict[str, list] = {}
+        groups: dict[int, list] = {}
+        for f in faces:
+            if f["person"]:
+                named.setdefault(f["person"], []).append(f)
+            elif f["cluster"] is not None:
+                groups.setdefault(f["cluster"], []).append(f)
+        people_out = [
+            {"name": n, "faces": [f["id"] for f in fs[:1]], "photos": tagged.get(n, len({f["asset"] for f in fs}))}
+            for n, fs in named.items()
+        ]
+        # people known only from tags (e.g. Google Photos names) without a recognised face yet
+        people_out += [{"name": n, "faces": [], "photos": c} for n, c in tagged.items() if n not in named]
+        people_out.sort(key=lambda p: (-p["photos"], p["name"].lower()))
+        groups_out = []
+        for cid, fs in groups.items():
+            suggestions = [f["suggested"] for f in fs if f["suggested"]]
+            suggested = max(set(suggestions), key=suggestions.count) if suggestions else None
+            groups_out.append({"cluster": cid, "faces": [f["id"] for f in fs], "photos": len({f["asset"] for f in fs}),
+                               "suggested": suggested})
+        groups_out.sort(key=lambda g: (-g["photos"], g["cluster"]))
+        return {"people": people_out, "groups": groups_out}
+
+    @app.post("/api/people/name")
+    def name_people(body: FaceName) -> dict:
+        from photoorg.ai import faces as face_ai
+
+        with db() as conn:
+            try:
+                face_ai.name_faces(conn, body.faces, body.name)
+            except ValueError as ex:
+                raise HTTPException(400, str(ex)) from ex
+        return {"ok": True}
+
+    @app.post("/api/faces/{face_id}/reject")
+    def reject(face_id: int) -> dict:
+        from photoorg.ai import faces as face_ai
+
+        with db() as conn:
+            try:
+                face_ai.reject_face(conn, face_id)
+            except ValueError as ex:
+                raise HTTPException(404, str(ex)) from ex
+        return {"ok": True}
+
+    @app.get("/media/face/{face_id}")
+    def face_image(face_id: int) -> Response:
+        cached = work / "cache" / "faces" / f"{face_id}.jpg"
+        if not cached.exists():
+            with db() as conn:
+                face = conn.execute("SELECT * FROM faces WHERE id = ?", (face_id,)).fetchone()
+                row = face and conn.execute(
+                    "SELECT i.*, s.path FROM items i JOIN sources s ON s.id = i.source_id WHERE i.sha256 = ? LIMIT 1",
+                    (face["sha256"],)).fetchone()
+            if not face or not row:
+                raise HTTPException(404, "volto non trovato")
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_bytes(_face_crop(library, row, face))
+        return FileResponse(cached, media_type="image/jpeg", headers=CACHE_FOREVER)
+
+    @app.get("/api/search")
+    def search_assets(user: str, q: str) -> dict:
+        from photoorg.ai import search as ai_search
+
+        with db() as conn:
+            ids = ai_search.search(conn, user, q)
+            if not ids:
+                return {"items": []}
+            rank = {a: n for n, a in enumerate(ids)}
+            marks = ",".join("?" * len(ids))
+            rows = conn.execute(
+                f"SELECT a.id a, a.kind, a.date_local, a.n_items, a.variant_group, a.favorite, i.id, i.sha256, "
+                f"i.width, i.height, i.orientation FROM assets a JOIN items i ON i.id = a.winner_id WHERE a.id IN ({marks})",
+                ids).fetchall()
+        out = []
+        for r in sorted(rows, key=lambda r: rank[r["a"]]):
+            w, h = _dims(r)
+            out.append({"a": r["a"], "i": r["id"], "v": _v(r), "k": r["kind"], "w": w, "h": h, "d": r["date_local"],
+                        "n": r["n_items"], "g": r["variant_group"], "al": None, "f": r["favorite"]})
+        return {"items": out}
 
     # ---------- events ----------
 

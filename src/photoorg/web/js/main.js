@@ -5,8 +5,8 @@ import { esc, icon, num, plural } from './format.js';
 import { Gallery } from './gallery.js';
 import { Lightbox } from './lightbox.js';
 import {
-  renderDuplicates, renderEvents, renderIssues, renderJobPanel, renderNas, renderOverview, renderSources, renderTrash,
-  renderVariants,
+  renderDuplicates, renderEvents, renderIssues, renderJobPanel, renderNas, renderOverview, renderPeople, renderSources,
+  renderTrash, renderVariants,
 } from './views.js';
 
 const $ = (s) => document.querySelector(s);
@@ -33,10 +33,20 @@ const ctx = {
   startJob: (url) => startJob(url),
   gotoDate: (date) => {
     pendingDate = date;
+    galleryQuery = '';
+    galleryStale = true;
     if (location.hash === '#/galleria') route(); else location.hash = '#/galleria';
   },
+  searchFor: (query) => {
+    galleryQuery = query;
+    galleryStale = true;
+    galleryScroll = 0;
+    if (location.hash === '#/galleria') route(); else location.hash = '#/galleria';
+  },
+  loadNames: () => loadNames(),
 };
 let pendingDate = null;
+let galleryQuery = '';
 
 let galleryUser = null;
 let galleryStale = false;
@@ -52,6 +62,11 @@ const gallery = new Gallery(galleryView, main, {
     }, { removeWhen: (e) => e.excluded });
   },
   onSelect: (items) => renderSelectionBar(items),
+  onSearch: (query) => {
+    galleryQuery = query;
+    galleryScroll = 0;
+    reloadGallery().then(() => { main.scrollTop = 0; });
+  },
 });
 
 // ---------- data ----------
@@ -109,10 +124,23 @@ async function loadGallery() {
   galleryStale = false;
   lightbox.invalidate();
   if (!ctx.user) { gallery.entries = []; gallery.empty(emptyArchive()); return; }
-  const { items } = await api.get(`/api/timeline?${q({ user: ctx.user })}`);
-  gallery.entries = items.map((it) => ({
+  const toEntries = (items) => items.map((it) => ({
     item: it.i, v: it.v, w: it.w, h: it.h, kind: it.k, date: it.d, asset: it.a, fav: Boolean(it.f), excluded: false, caption: it.al,
   }));
+  if (galleryQuery) {
+    const { items } = await api.get(`/api/search?${q({ user: ctx.user, q: galleryQuery })}`);
+    gallery.entries = toEntries(items);
+    if (items.length) {
+      gallery.setData(items, { results: `${plural(items.length, 'risultato', 'risultati')} per «${galleryQuery}»`, query: galleryQuery });
+    } else {
+      gallery.empty(`<div class="empty"><h2>Nessun risultato</h2>
+        <p>Nessuna foto corrisponde a «${esc(galleryQuery)}». Prova con un luogo, una persona, un oggetto o un momento, per esempio “mare”, “compleanno”, “neve”.</p></div>`,
+      { results: '', query: galleryQuery });
+    }
+    return;
+  }
+  const { items } = await api.get(`/api/timeline?${q({ user: ctx.user })}`);
+  gallery.entries = toEntries(items);
   if (items.length) gallery.setData(items); else gallery.empty(emptyArchive());
 }
 
@@ -125,6 +153,7 @@ async function reloadGallery() {
 }
 
 lightbox.onClose = () => { if (galleryStale && ctx.current === 'galleria') reloadGallery(); };
+lightbox.onSearch = (query) => ctx.searchFor(query);
 lightbox.onChange = (change) => {
   if (change.error) { toast(change.error); return; }
   galleryStale = true;
@@ -260,6 +289,7 @@ const SCREENS = {
   cestino: renderTrash,
   fonti: renderSources,
   nas: renderNas,
+  persone: renderPeople,
 };
 
 async function route() {
@@ -318,6 +348,7 @@ let jobKind = 'scan';
 const JOB_DONE = {
   scan: ['Archivio aggiornato', 'Aggiornamento non riuscito: i dettagli sono in Fonti'],
   export: ['Archivio sul NAS aggiornato', 'Copia sul NAS non riuscita: i dettagli sono in Archivio NAS'],
+  ai: ['Analisi completata: volti ed etichette pronti', 'Analisi non riuscita: i dettagli sono in Persone'],
 };
 
 async function pollJob() {
@@ -329,7 +360,7 @@ async function pollJob() {
       job = await api.get('/api/job');
       ctx.state.job = job;
       renderJobMini(job);
-      if (ctx.current === 'fonti' || ctx.current === 'nas') renderJobPanel($('.jobpanel-slot'), job);
+      if (['fonti', 'nas', 'persone'].includes(ctx.current)) renderJobPanel($('.jobpanel-slot'), job);
       if (!job.running) break;
       await sleep(700);
     }
@@ -346,11 +377,11 @@ async function pollJob() {
 
 /** Start a background operation (scan or export) and follow its progress. */
 async function startJob(url) {
-  jobKind = url.includes('export') ? 'export' : 'scan';
+  jobKind = url.includes('export') ? 'export' : url.includes('/ai/') ? 'ai' : 'scan';
   try {
     ctx.state.job = await api.post(url);
     renderJobMini(ctx.state.job);
-    if (['fonti', 'panoramica', 'nas'].includes(ctx.current)) await route();
+    if (['fonti', 'panoramica', 'nas', 'persone'].includes(ctx.current)) await route();
     pollJob();
   } catch (err) {
     toast(err.message);

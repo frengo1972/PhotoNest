@@ -82,6 +82,28 @@ Azioni: "Tieni questa", "Non è un duplicato", "Confermo il gruppo". Le decision
 Copia (non sposta) sul NAS: `/Foto/<utente>/AAAA/AAAA-MM-GG_evento/`, con XMP.
 Report finale: conteggi per fonte, duplicati risolti, file senza data, errori.
 
+### 5b. AI locale (implementata)
+
+Tutto gira su questo PC, nessuna foto esce. Modelli in `%LOCALAPPDATA%\photoorg\models`, scaricati al primo uso.
+
+| Compito | Modello | Esecuzione |
+|---|---|---|
+| Volti: rilevamento | YuNet (OpenCV zoo) | CPU, ~50 ms/foto a 1600 px |
+| Volti: identità | SFace 128-d (OpenCV zoo) | CPU |
+| Etichette automatiche | CLIP ViT-B/32 ONNX (Xenova) zero-shot su `ai/vocab.py` | GPU via DirectML (niente CUDA/PyTorch) |
+| Ricerca in italiano | clip-ViT-B-32-multilingual-v1 (stesso spazio di CLIP) | CPU, solo il testo cercato |
+
+- Ogni foto è decodificata una volta; risultati salvati per sha256 (`ai_done`, `clip_embeddings`, `faces`): mai rifatti.
+- Etichette: CLIP è affidabile sul soggetto principale (0,75–1,0 sulle foto reali) ma non separa una seconda
+  etichetta vera da quelle sbagliate → etichetta principale + seconda solo se forte + implicazioni fisse
+  (kitesurf ⇒ mare, sport). Il resto lo copre la ricerca per somiglianza.
+- Ricerca: prima corrispondenze esatte (etichette, persone, album, eventi, descrizioni; "kitesurf" ⇒ "surf e kite"),
+  poi somiglianza CLIP. Le somiglianze multilingue sono compresse: conta quanto una foto si stacca dalla mediana
+  della collezione (0,04), oppure un valore alto in assoluto (0,25) per collezioni omogenee.
+- Volti: gruppi di volti simili (coseno ≥ 0,45), suggerimento del nome se vicino a una persona già nominata (≥ 0,42).
+  Dare un nome a un gruppo = tag "persona" su tutte le sue foto (finisce nel NAS come gli altri tag).
+- Nel NAS le etichette automatiche vanno in `Riconosciuti|…` (XMP lr:HierarchicalSubject), separate da quelle date a mano.
+
 ### 6b. Ricaricamento su Google Photos (opzionale)
 Dall'archivio finale, per utente, verso un account scelto.
 

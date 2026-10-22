@@ -10,6 +10,12 @@ dependencies = [
     "tzdata>=2024.1",
     "fastapi>=0.115",
     "uvicorn>=0.30",
+    # local AI: faces (OpenCV YuNet + SFace), tags and search (CLIP via ONNX Runtime, GPU through DirectML)
+    "opencv-python-headless>=4.10",
+    "onnxruntime-directml>=1.20; sys_platform == 'win32'",
+    "onnxruntime>=1.20; sys_platform != 'win32'",
+    "tokenizers>=0.20",
+    "safetensors>=0.4",
 ]
 
 [project.scripts]

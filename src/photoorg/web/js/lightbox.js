@@ -348,6 +348,11 @@ export class Lightbox {
     const t = ev.target.closest('button');
     if (!t || !this.entry?.asset) return;
     const e = this.entry;
+    if (t.dataset.search) {
+      await this.close();
+      this.onSearch?.(t.dataset.search);
+      return;
+    }
     if (t.dataset.tagRemove) {
       await this.changeTags(t.dataset.kind, [], [t.dataset.tagRemove]);
     } else if ('dateEdit' in t.dataset) {
@@ -644,6 +649,9 @@ export function assetInfo(a, { editingDate = false } = {}) {
     ${tagSection('album', a.albums)}
     ${tagSection('person', a.people)}
     ${tagSection('keyword', a.keywords ?? [])}
+    ${a.auto_tags?.length ? `<section><h3>Riconosciuto automaticamente</h3><div class="chips">${a.auto_tags.map((t) =>
+      `<button type="button" class="chip auto chip-link" data-search="${esc(t)}" title="Cerca le foto con ${esc(t)}">${esc(t)}</button>`).join('')}</div></section>` : ''}
+    ${a.event?.name ? `<section><h3>Evento</h3><p>${esc(a.event.name)}</p></section>` : ''}
     ${a.description ? `<section><h3>Descrizione</h3><p>${esc(a.description)}</p></section>` : ''}
     <section><h3>Scatto</h3>
       ${camera ? `<p>${esc(camera)}</p>` : ''}

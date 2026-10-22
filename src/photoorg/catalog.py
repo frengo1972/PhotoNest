@@ -172,6 +172,39 @@ CREATE TABLE IF NOT EXISTS event_assets (
     event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE
 );
 
+-- Local AI, keyed by content: an analysis is never repeated for the same photo.
+CREATE TABLE IF NOT EXISTS ai_done (
+    sha256  TEXT NOT NULL,
+    task    TEXT NOT NULL,          -- faces | clip
+    version INTEGER NOT NULL,
+    PRIMARY KEY (sha256, task)
+);
+
+CREATE TABLE IF NOT EXISTS clip_embeddings (
+    sha256  TEXT PRIMARY KEY,
+    emb     BLOB NOT NULL           -- float16[512], L2-normalised
+);
+
+CREATE TABLE IF NOT EXISTS auto_tags (
+    sha256  TEXT NOT NULL,
+    tag     TEXT NOT NULL,
+    score   REAL NOT NULL,
+    PRIMARY KEY (sha256, tag)
+);
+
+CREATE TABLE IF NOT EXISTS faces (
+    id          INTEGER PRIMARY KEY,
+    sha256      TEXT NOT NULL,
+    x REAL, y REAL, w REAL, h REAL,     -- box relative to the upright image (0..1)
+    score       REAL NOT NULL,
+    emb         BLOB NOT NULL,          -- float32[128] SFace, L2-normalised
+    cluster     INTEGER,                -- group of similar unnamed faces (rebuilt)
+    person      TEXT,                   -- name given by the user
+    suggested   TEXT,                   -- name the face probably belongs to (rebuilt)
+    rejected    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS faces_sha ON faces(sha256);
+
 CREATE TABLE IF NOT EXISTS settings (
     key     TEXT PRIMARY KEY,
     value   TEXT NOT NULL

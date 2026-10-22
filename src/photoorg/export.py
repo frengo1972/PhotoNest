@@ -133,6 +133,8 @@ def metadata_args(a: sqlite3.Row, tags: dict[str, list[str]], event_name: str | 
     if event_name:
         subjects.append(event_name)
         hierarchy.append(f"Eventi|{event_name}")
+    # automatic tags stay in their own branch: useful for searching, never mixed with the user's keywords
+    hierarchy += [f"Riconosciuti|{t}" for t in tags.get("auto", [])]
     args += ["-XMP-dc:Subject=", "-XMP-lr:HierarchicalSubject=", "-XMP-iptcExt:PersonInImage="]
     args += [f"-XMP-dc:Subject+={s}" for s in dict.fromkeys(subjects)]
     args += [f"-XMP-lr:HierarchicalSubject+={h}" for h in dict.fromkeys(hierarchy)]
@@ -152,6 +154,11 @@ def _tags(conn: sqlite3.Connection) -> dict[int, dict[str, list[str]]]:
                                 ("keyword", "asset_keywords", "name")):
         for asset_id, value in conn.execute(f"SELECT asset_id, {column} FROM {table} ORDER BY {column} COLLATE NOCASE"):
             out[asset_id][kind].append(value)
+    for asset_id, tag in conn.execute(
+        "SELECT a.id, t.tag FROM assets a JOIN items i ON i.id = a.winner_id JOIN auto_tags t ON t.sha256 = i.sha256 "
+        "ORDER BY t.score DESC"
+    ):
+        out[asset_id]["auto"].append(tag)
     return out
 
 
@@ -316,13 +323,14 @@ def write_indexes(conn: sqlite3.Connection, root: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f, delimiter=";")
-            w.writerow(["file", "data", "fonte data", "evento", "persone", "album", "etichette", "preferita",
-                        "descrizione", "latitudine", "longitudine", "sha256", "copie trovate"])
+            w.writerow(["file", "data", "fonte data", "evento", "persone", "album", "etichette", "riconosciuti",
+                        "preferita", "descrizione", "latitudine", "longitudine", "sha256", "copie trovate"])
             for r in user_rows:
                 t = tags[r["id"]]
                 w.writerow([
                     r["rel_path"].partition("/")[2], r["date_local"] or "", r["date_source"] or "", r["ev_name"] or "",
                     ", ".join(t.get("person", [])), ", ".join(t.get("album", [])), ", ".join(t.get("keyword", [])),
+                    ", ".join(t.get("auto", [])),
                     "sì" if r["favorite"] else "", r["description"] or "", r["lat"] or "", r["lon"] or "",
                     r["sha256"], " | ".join(sources[r["id"]]),
                 ])

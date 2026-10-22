@@ -44,11 +44,29 @@ function nasStep(nas) {
   };
 }
 
+function aiStep(ai, c) {
+  if (!ai || !ai.total) return { done: false, text: 'Dopo il primo aggiornamento, l’AI può riconoscere volti, luoghi e oggetti.', action: '' };
+  if (ai.pending) {
+    return {
+      done: false,
+      text: `${plural(ai.pending, 'foto da analizzare', 'foto da analizzare')}: volti, luoghi e oggetti vengono riconosciuti su questo PC, nessuna foto esce dal computer.`,
+      action: `<button class="btn btn-primary" type="button" data-ai-analyze>Analizza le foto</button>`,
+    };
+  }
+  if (c.face_groups) {
+    return { done: false, text: `${plural(c.face_groups, 'gruppo di volti', 'gruppi di volti')} da riconoscere: dai un nome e verrà aggiunto a tutte le foto.`, action: 'persone' };
+  }
+  return { done: true, text: `Foto analizzate: ${num(ai.tagged)} hanno etichette automatiche, ${num(ai.faces)} volti trovati.`, action: '' };
+}
+
 export async function renderOverview(el, ctx) {
   const s = ctx.state;
   const c = s.counts;
-  const nas = s.user ? await api.get('/api/nas').catch(() => null) : null;
+  const [nas, ai] = s.user
+    ? await Promise.all([api.get('/api/nas').catch(() => null), api.get('/api/ai').catch(() => null)])
+    : [null, null];
   const ns = nasStep(nas);
+  const as = aiStep(ai, c);
   const google = s.sources.filter((x) => x.type === 'google' || x.type === 'icloud').length;
   const devices = s.sources.length - google;
   const step = (n, done, title, text, action = '', later = false) => `
@@ -85,12 +103,94 @@ export async function renderOverview(el, ctx) {
       ${step(4, s.user && !c.issues, 'Verifica le date',
         c.issues ? `${plural(c.issues, 'foto ha', 'foto hanno')} date incoerenti o mancanti.` : 'Tutte le date sono coerenti.',
         c.issues ? go('verifica', 'Correggi', true) : '')}
-      ${step(5, false, 'Ordina e sistema',
-        'Nella galleria seleziona le foto per escluderle, metterle tra le preferite, aggiungerle a un album, indicare le persone o correggere la data.',
+      ${step(5, as.done, 'Riconosci persone e cose', esc(as.text),
+        as.action === 'persone' ? go('persone', 'Dai un nome', true) : as.action)}
+      ${step(6, false, 'Ordina e sistema',
+        'Nella galleria cerca, seleziona le foto per escluderle, metterle tra le preferite, aggiungerle a un album, indicare le persone o correggere la data.',
         go('galleria', 'Apri la galleria'))}
-      ${step(6, ns.done, 'Crea l’archivio sul NAS', `${esc(ns.text)} Le foto sono ordinate per anno ed evento, con tutti i dati scritti nei file.`,
+      ${step(7, ns.done, 'Crea l’archivio sul NAS', `${esc(ns.text)} Le foto sono ordinate per anno ed evento, con tutti i dati scritti nei file.`,
         go('nas', ns.label, !ns.done && Boolean(s.user)))}
     </ol></div>`;
+  el.onclick = (e) => {
+    if (e.target.closest('[data-ai-analyze]')) ctx.startJob('/api/ai/analyze');
+  };
+}
+
+// ---------------------------------------------------------------- people
+
+const faceImg = (id, cls = '') => `<img class="${cls}" src="/media/face/${id}" alt="" loading="lazy" draggable="false">`;
+
+export async function renderPeople(el, ctx) {
+  const [ai, data] = await Promise.all([api.get('/api/ai'), api.get(`/api/people?${q({ user: ctx.user })}`)]);
+  const opts = (ctx.viewState.persone ??= { singles: false });
+  const multi = data.groups.filter((g) => g.photos >= 2);
+  const singles = data.groups.filter((g) => g.photos < 2);
+  const shown = opts.singles ? data.groups : multi;
+  const groupRow = (g) => `
+    <div class="face-group" data-cluster="${g.cluster}">
+      <div class="face-row">${g.faces.slice(0, 8).map((id) => `
+        <span class="face">${faceImg(id)}<button class="reject" type="button" data-reject="${id}" title="Non fa parte del gruppo" aria-label="Togli questo volto">${icon('i-close')}</button></span>`).join('')}</div>
+      <div class="info"><b>${plural(g.photos, 'foto', 'foto')}</b><span>${g.faces.length > 8 ? `e altri ${num(g.faces.length - 8)} volti` : ''}</span></div>
+      <div class="tools">
+        ${g.suggested ? `<button class="btn btn-primary" type="button" data-name="${esc(g.suggested)}">Sì, è ${esc(g.suggested)}</button>` : ''}
+        <button class="btn ${g.suggested ? '' : 'btn-primary'}" type="button" data-ask>${g.suggested ? 'È qualcun altro' : 'Chi è?'}</button>
+      </div>
+    </div>`;
+  const person = (p) => `
+    <button class="person" type="button" data-person="${esc(p.name)}">
+      <span class="avatar">${p.faces.length ? faceImg(p.faces[0]) : esc(p.name.slice(0, 1).toUpperCase())}</span>
+      <b>${esc(p.name)}</b><span>${plural(p.photos, 'foto', 'foto')}</span>
+    </button>`;
+  const analyzeBtn = ai.pending
+    ? `<button class="btn btn-primary" type="button" data-analyze ${ctx.state.job.running ? 'disabled' : ''}>Analizza ${plural(ai.pending, 'foto', 'foto')}</button>`
+    : '';
+
+  el.innerHTML = `<div class="page">
+    ${pageHead('Persone',
+      'I volti vengono riconosciuti su questo PC: nessuna foto esce dal computer. Dai un nome a un gruppo e il nome viene aggiunto a tutte le sue foto, anche nell’archivio sul NAS.',
+      analyzeBtn)}
+    <div class="jobpanel-slot"></div>
+    ${!ai.total ? emptyBlock('Ancora nessuna foto', 'Aggiorna l’archivio, poi analizza le foto.')
+      : ai.pending === ai.total ? emptyBlock('Le foto non sono ancora state analizzate', 'L’analisi trova i volti e li raggruppa per persona. Le foto già analizzate non vengono rifatte.')
+        : ''}
+    ${shown.length ? `<h2 class="section-title">Da riconoscere</h2>${shown.map(groupRow).join('')}` : ''}
+    ${singles.length ? `<div class="more"><button class="btn btn-quiet" type="button" data-singles>${opts.singles ? 'Nascondi i volti visti una volta sola' : `Mostra anche i volti visti una volta sola (${num(singles.length)})`}</button></div>` : ''}
+    ${data.people.length ? `<h2 class="section-title">Con un nome</h2><div class="people-grid">${data.people.map(person).join('')}</div>` : ''}
+  </div>`;
+  renderJobPanel(el.querySelector('.jobpanel-slot'), ctx.state.job);
+
+  el.onclick = async (e) => {
+    const t = e.target.closest('button');
+    if (!t) return;
+    try {
+      if ('analyze' in t.dataset) { t.disabled = true; await ctx.startJob('/api/ai/analyze'); return; }
+      if ('singles' in t.dataset) { opts.singles = !opts.singles; renderPeople(el, ctx); return; }
+      if (t.dataset.person) { ctx.searchFor(t.dataset.person); return; }
+      if (t.dataset.reject) {
+        await api.post(`/api/faces/${t.dataset.reject}/reject`);
+        renderPeople(el, ctx);
+        return;
+      }
+      const row = t.closest('[data-cluster]');
+      const g = row && data.groups.find((x) => x.cluster === Number(row.dataset.cluster));
+      if (!g) return;
+      const name = t.dataset.name ?? await ctx.ask({
+        title: 'Chi è?', text: `Il nome verrà aggiunto a ${plural(g.photos, 'foto', 'foto')}.`, label: 'Nome',
+        list: 'names-person', confirm: 'Salva', hint: 'Se il nome esiste già, i due gruppi vengono uniti.',
+      });
+      if (!name) return;
+      t.disabled = true;
+      await api.post('/api/people/name', { faces: g.faces, name });
+      ctx.toast(`${name}: ${plural(g.photos, 'foto', 'foto')}`);
+      ctx.galleryChanged();
+      ctx.loadNames();
+      await ctx.refresh();
+      renderPeople(el, ctx);
+    } catch (err) {
+      t.disabled = false;
+      ctx.toast(err.message);
+    }
+  };
 }
 
 // ---------------------------------------------------------------- NAS archive

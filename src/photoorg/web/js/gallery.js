@@ -44,11 +44,13 @@ export function justify(items, width, target) {
 }
 
 export class Gallery {
-  constructor(root, scroller, { onOpen, onSelect }) {
+  constructor(root, scroller, { onOpen, onSelect, onSearch }) {
     this.root = root;
     this.scroller = scroller;
     this.onOpen = onOpen;
     this.onSelect = onSelect;
+    this.onSearch = onSearch;
+    this.results = null; // title of the search results section, null for the timeline
     this.items = [];
     this.days = [];
     this.tiles = new Map();
@@ -60,6 +62,10 @@ export class Gallery {
     root.innerHTML = `
       <header class="gallery-head">
         <h1></h1><span class="total"></span>
+        <form class="search" role="search">
+          <input type="search" placeholder="Cerca persone, luoghi, cose…" aria-label="Cerca nell’archivio" autocomplete="off" list="names-person">
+          <button type="button" class="btn btn-quiet clear-search" hidden>Mostra tutte</button>
+        </form>
         <div class="zoom" role="group" aria-label="Dimensione anteprime">
           <button type="button" data-zoom="-1" title="Anteprime più piccole (Ctrl + rotellina)" aria-label="Anteprime più piccole">${icon('i-minus')}</button>
           <button type="button" data-zoom="1" title="Anteprime più grandi (Ctrl + rotellina)" aria-label="Anteprime più grandi">${icon('i-plus')}</button>
@@ -74,6 +80,14 @@ export class Gallery {
     this.years = root.querySelector('.years');
     this.zoomButtons = [...this.head.querySelectorAll('[data-zoom]')];
     this.updateZoomButtons();
+    this.searchInput = this.head.querySelector('.search input');
+    this.clearButton = this.head.querySelector('.clear-search');
+    this.head.querySelector('.search').addEventListener('submit', (e) => {
+      e.preventDefault();
+      this.onSearch?.(this.searchInput.value.trim());
+    });
+    this.searchInput.addEventListener('search', () => { if (!this.searchInput.value) this.onSearch?.(''); });
+    this.clearButton.addEventListener('click', () => { this.searchInput.value = ''; this.onSearch?.(''); });
 
     this.io = new IntersectionObserver((entries) => {
       for (const e of entries) if (e.isIntersecting) this.materialize(this.dayOf.get(e.target));
@@ -101,8 +115,12 @@ export class Gallery {
 
   // ---------- data ----------
 
-  setData(items) {
+  /** items: timeline rows. With `results` (a title) they are shown as one section, in the given order. */
+  setData(items, { results = null, query = '' } = {}) {
     this.items = items;
+    this.results = results;
+    this.searchInput.value = query;
+    this.clearButton.hidden = results === null;
     this.tiles.clear();
     this.selected.clear();
     this.anchor = null;
@@ -112,7 +130,7 @@ export class Gallery {
     this.days = [];
     let cur = null;
     items.forEach((it, idx) => {
-      const key = it.d ? it.d.slice(0, 10) : 'none';
+      const key = results !== null ? 'results' : it.d ? it.d.slice(0, 10) : 'none';
       if (!cur || cur.key !== key) {
         cur = { key, date: it.d, start: idx, end: idx, albums: new Set() };
         this.days.push(cur);
@@ -126,7 +144,8 @@ export class Gallery {
       const sec = document.createElement('section');
       sec.className = 'day';
       const albums = [...day.albums].slice(0, 2).join(', ');
-      sec.innerHTML = `<header class="day-head"><h2>${esc(dayTitle(day.date))}</h2>${albums ? `<span>${esc(albums)}</span>` : ''}</header><div class="rows"></div>`;
+      const title = results !== null ? results : dayTitle(day.date);
+      sec.innerHTML = `<header class="day-head"><h2>${esc(title)}</h2>${albums && results === null ? `<span>${esc(albums)}</span>` : ''}</header><div class="rows"></div>`;
       day.el = sec;
       day.rowsEl = sec.lastElementChild;
       day.label = dayTitle(day.date, true);
@@ -138,16 +157,16 @@ export class Gallery {
     const videos = items.filter((it) => it.k === 'video').length;
     const photos = items.length - videos;
     this.total.textContent = videos ? `${num(photos)} foto, ${num(videos)} video` : `${num(photos)} foto`;
-    this.years.innerHTML = this.yearButtons();
+    this.years.innerHTML = results !== null ? '' : this.yearButtons();
     this.layout();
     for (const day of this.days) this.io.observe(day.el);
     this.updateHead();
     this.onSelect?.(this.selection());
   }
 
-  empty(html) {
-    this.setData([]);
-    this.title.textContent = 'Galleria';
+  empty(html, opts = {}) {
+    this.setData([], opts);
+    this.title.textContent = opts.results !== undefined && opts.results !== null ? 'Ricerca' : 'Galleria';
     this.total.textContent = '';
     this.body.innerHTML = html;
   }
@@ -283,7 +302,7 @@ export class Gallery {
     if (!this.days.length) return;
     const y = this.scroller.scrollTop + this.head.offsetHeight + 1;
     const day = this.days[this.dayIndexAt(y)];
-    this.title.textContent = monthTitle(day.date);
+    this.title.textContent = this.results !== null ? 'Ricerca' : monthTitle(day.date);
     this.head.classList.toggle('scrolled', this.scroller.scrollTop > 4);
     const year = day.date?.slice(0, 4);
     for (const b of this.years.children) b.setAttribute('aria-current', String(b.dataset.year === year));
