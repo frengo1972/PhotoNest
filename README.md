@@ -56,6 +56,11 @@ uv sync                     # crea l'ambiente Python 3.12
 uv run photoorg shortcut    # crea l'icona "Archivio foto" sul desktop
 ```
 
+Sviluppo: `uv run photoorg dev` avvia l'app con un supervisore che **riavvia il server a ogni modifica dei file .py**
+(aspettando la fine di un aggiornamento/export/analisi in corso) e la pagina **si ricarica da sola** quando cambiano
+server o file web, restando sulla stessa schermata. Log in console (o in `work/dev.log` se avviato in background).
+Il supervisore stesso (`devserver.py`) va riavviato a mano se lo si modifica.
+
 Riga di comando (facoltativa, per automazioni e test):
 
 ```powershell

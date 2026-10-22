@@ -435,6 +435,21 @@ $('#user').addEventListener('change', async (e) => {
 addEventListener('hashchange', route);
 setInterval(() => api.get('/api/ping').catch(() => {}), 20000); // keeps the local server alive while the window is open
 
+/** Development mode (`photoorg dev`): reload the page when the server restarts or a web file changes. */
+async function watchDevBuild() {
+  let known = null;
+  for (;;) {
+    try {
+      const { build } = await api.get('/api/dev');
+      if (known && build !== known && lightbox.el.hidden && !$('#sheet').open) location.reload();
+      known ??= build;
+    } catch {
+      // server restarting: keep polling until it answers again
+    }
+    await sleep(1500);
+  }
+}
+
 (async () => {
   try {
     await refresh();
@@ -445,4 +460,5 @@ setInterval(() => api.get('/api/ping').catch(() => {}), 20000); // keeps the loc
   loadNames();
   await route();
   if (ctx.state.job.running) pollJob();
+  if (ctx.state.dev) watchDevBuild();
 })();

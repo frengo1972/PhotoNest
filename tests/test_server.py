@@ -119,6 +119,14 @@ def test_keep_one_variant(client):
     assert client.post("/api/variants/keep", json={"group": group["group"], "keep": [999]}).status_code == 400
 
 
+def test_changes_only_from_the_app_page(client):
+    evil = client.post("/api/scan", headers={"Origin": "http://evil.example", "Host": "127.0.0.1:8765"})
+    assert evil.status_code == 403
+    own = client.post("/api/rebuild", headers={"Origin": "http://127.0.0.1:8765", "Host": "127.0.0.1:8765"})
+    assert own.status_code == 200
+    assert client.get("/api/state", headers={"Origin": "http://evil.example"}).status_code == 200  # reads stay open
+
+
 def test_decisions_validation_and_rebuild(client):
     _scan(client)
     assert client.post("/api/decide", json={"sha": "x", "action": "nope"}).status_code == 400

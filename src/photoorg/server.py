@@ -28,7 +28,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -42,6 +42,8 @@ from photoorg.sources import discover_sources
 
 WEB = Path(__file__).parent / "web"
 APP_ID = "photoorg"
+DEV = os.environ.get("PHOTOORG_DEV") == "1"  # set by `photoorg dev`
+STARTED = time.time_ns()
 PORT_TRIES = 20  # if the preferred port is taken by another program, try the next ones
 IDLE_EXIT_SECONDS = 180
 PROGRESS_LINE = re.compile(r"^\s*\d+/\d+\s*$")
@@ -265,6 +267,10 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
 
     @app.middleware("http")
     async def touch(request, call_next):
+        # A web page from another site could send requests to 127.0.0.1: changes are accepted only from the app's own page.
+        origin = request.headers.get("origin")
+        if request.method != "GET" and origin and origin != f"http://{request.headers.get('host')}":
+            return JSONResponse({"detail": "richiesta non consentita"}, status_code=403)
         app.state.last_seen = time.monotonic()
         return await call_next(request)
 
@@ -273,6 +279,23 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
     @app.get("/api/ping")
     def ping() -> dict:
         return {"ok": True, "app": APP_ID}
+
+    @app.get("/api/dev")
+    def dev_build() -> dict:
+        """Development mode: changes when the server restarts or a web file changes; the page then reloads."""
+        if not DEV:
+            raise HTTPException(404, "non in modalità sviluppo")
+        newest = max(p.stat().st_mtime_ns for p in WEB.rglob("*") if p.is_file())
+        return {"build": f"{STARTED}-{newest}"}
+
+    @app.post("/api/shutdown")
+    def shutdown() -> dict:
+        """Used by the development supervisor to restart the server cleanly."""
+        server = getattr(app.state, "server", None)
+        if server is None:
+            raise HTTPException(404, "non disponibile")
+        server.should_exit = True
+        return {"ok": True}
 
     @app.get("/api/state")
     def state(user: str | None = None) -> dict:
@@ -309,7 +332,7 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
             "counts": {**dict(counts), "issues": issues, "variants_todo": variants_todo, "events": n_events,
                        "face_groups": face_groups},
             "sources": sources, "pending": pending, "warnings": warnings,
-            "income": str(income.resolve()), "job": job.snapshot(),
+            "income": str(income.resolve()), "job": job.snapshot(), "dev": DEV,
         }
 
     @app.get("/api/timeline")
@@ -798,26 +821,29 @@ def open_window(url: str) -> None:
         webbrowser.open(url)
 
 
-def run_app(work: Path, income: Path, tz: str, port: int, window: bool = True) -> None:
+def run_app(work: Path, income: Path, tz: str, port: int, window: bool = True, strict_port: bool = False) -> None:
+    """strict_port: use exactly `port` or fail (the development supervisor keeps the page on one address)."""
     port_file = work / "app.port"  # port of the running instance, so a second launch finds it
     try:
         last = int(port_file.read_text())
     except (OSError, ValueError):
         last = None
-    for candidate in dict.fromkeys(p for p in (last, port) if p):
+    for candidate in dict.fromkeys(p for p in (last, port) if p and not strict_port):
         if _ours(candidate):  # already running: just show it
             if window:
                 open_window(f"http://127.0.0.1:{candidate}/")
             return
     preferred = port
-    port = next((p for p in range(preferred, preferred + PORT_TRIES) if _free(p)), None)
+    tries = 1 if strict_port else PORT_TRIES
+    port = next((p for p in range(preferred, preferred + tries) if _free(p)), None)
     if port is None:
-        raise SystemExit(f"Nessuna porta libera tra {preferred} e {preferred + PORT_TRIES - 1}")
+        raise SystemExit(f"Nessuna porta libera tra {preferred} e {preferred + tries - 1}")
     work.mkdir(parents=True, exist_ok=True)
     port_file.write_text(str(port))
     url = f"http://127.0.0.1:{port}/"
     app = create_app(work, income, tz)
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", log_config=None))
+    app.state.server = server
 
     def watch() -> None:
         while not server.started:

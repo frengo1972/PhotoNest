@@ -20,6 +20,7 @@ COMMANDS = {
     "dedup": "raggruppa le copie, sceglie la migliore, unisce i metadati (applica le decisioni di revisione)",
     "report": "riepilogo del catalogo",
     "shortcut": "crea sul desktop l'icona 'Archivio foto' che apre l'app",
+    "dev": "app in modalità sviluppo: riavvio del server a ogni modifica del codice, pagina ricaricata da sola",
 }
 
 
@@ -50,8 +51,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--tz", default="Europe/Rome", help="fuso orario se assente nei metadati (default: Europe/Rome)")
     sub = p.add_subparsers(dest="cmd")
     parsers = {name: sub.add_parser(name, help=help_) for name, help_ in COMMANDS.items()}
-    parsers["app"].add_argument("--port", type=int, default=8765)
-    parsers["app"].add_argument("--no-window", action="store_true", help="avvia solo il server, senza finestra")
+    for name in ("app", "dev"):
+        parsers[name].add_argument("--port", type=int, default=8765)
+        parsers[name].add_argument("--no-window", action="store_true", help="avvia solo il server, senza finestra")
+    parsers["app"].add_argument("--strict-port", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
     cmd = args.cmd or "app"
 
@@ -64,7 +67,12 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "app":
         from photoorg.server import run_app
 
-        run_app(args.work, args.income, args.tz, args.port, window=not args.no_window)
+        run_app(args.work, args.income, args.tz, args.port, window=not args.no_window, strict_port=args.strict_port)
+        return 0
+    if cmd == "dev":
+        from photoorg.devserver import run_dev
+
+        run_dev(args.work.resolve(), args.income.resolve(), args.tz, args.port, window=not args.no_window)
         return 0
     if cmd == "shortcut":
         print(f"Collegamento creato: {create_shortcut(args.income, args.work)}")
