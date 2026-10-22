@@ -28,7 +28,8 @@ def _item(conn, source_id, name, sha, phash=BASE, w=4000, h=3000, exif="2019:10:
     item_id = catalog.upsert_item(conn, source_id, row)
     conn.execute(
         "UPDATE items SET date_source = ?, date_conf = ?, date_local = ?, lat = ?, lon = ?, gps_source = ? WHERE id = ?",
-        ("exif" if exif else None, "high" if exif else None, exif, lat, lat, "exif" if lat else None, item_id),
+        ("exif" if exif else None, "high" if exif else None, exif and exif.replace(":", "-", 2), lat, lat,
+         "exif" if lat else None, item_id),
     )
     catalog.set_links(conn, item_id, [album] if album else [], [])
     return item_id

@@ -156,6 +156,39 @@ CREATE TABLE IF NOT EXISTS edit_tags (
     PRIMARY KEY (sha256, kind, name)
 );
 
+-- Events: consecutive photos of a user grouped by time and place (derived, rebuilt with the assets).
+CREATE TABLE IF NOT EXISTS events (
+    id          INTEGER PRIMARY KEY,
+    user        TEXT NOT NULL,
+    start_local TEXT NOT NULL,
+    end_local   TEXT NOT NULL,
+    n_assets    INTEGER NOT NULL,
+    name        TEXT,
+    name_source TEXT                -- user | album | NULL
+);
+
+CREATE TABLE IF NOT EXISTS event_assets (
+    asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+    event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key     TEXT PRIMARY KEY,
+    value   TEXT NOT NULL
+);
+
+-- What is already on the NAS, per destination root: lets an export copy only what changed.
+CREATE TABLE IF NOT EXISTS exported (
+    root        TEXT NOT NULL,
+    user        TEXT NOT NULL,
+    sha256      TEXT NOT NULL,      -- content of the exported copy
+    rel_path    TEXT NOT NULL,      -- relative to root
+    meta_hash   TEXT NOT NULL,      -- metadata written into the copy
+    size        INTEGER NOT NULL,
+    exported_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (root, user, sha256)
+);
+
 CREATE TABLE IF NOT EXISTS dedup_decisions (
     sha256      TEXT PRIMARY KEY,
     action      TEXT NOT NULL,      -- winner | separate
@@ -196,7 +229,17 @@ def connect(work: Path) -> sqlite3.Connection:
     return conn
 
 
-ASSET_TABLES = ("asset_keywords", "asset_people", "asset_albums", "asset_items", "assets")
+ASSET_TABLES = ("event_assets", "events", "asset_keywords", "asset_people", "asset_albums", "asset_items", "assets")
+
+
+def get_setting(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
 
 
 def _migrate(conn: sqlite3.Connection) -> None:

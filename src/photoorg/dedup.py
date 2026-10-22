@@ -27,7 +27,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 
-from photoorg import edits
+from photoorg import edits, events
 from photoorg.dates import parse_exif_dt
 from photoorg.edits import TAG_TABLES
 from photoorg.normalize import pair_stem
@@ -351,3 +351,4 @@ def build(conn: sqlite3.Connection, log: Callable[[str], None] = print) -> None:
             f"(identici scartati {stats['identical']}, simili uniti {stats['similar']}, "
             f"gruppi simili da rivedere {stats['to_review']}, gruppi varianti {variants})")
     conn.commit()
+    log(f"Eventi: {events.build(conn)}")

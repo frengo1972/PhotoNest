@@ -30,9 +30,25 @@ const seg = (attr, value, label, on) => `<button type="button" data-${attr}="${v
 
 // ---------------------------------------------------------------- overview
 
-export function renderOverview(el, ctx) {
+function nasStep(nas) {
+  if (!nas?.root) return { done: false, text: 'Scegli dove salvare l’archivio: per ora una cartella su V:, poi il NAS.', label: 'Scegli la destinazione' };
+  if (!nas.exists) return { done: false, text: `La destinazione ${nas.root} non è raggiungibile.`, label: 'Controlla' };
+  const p = nas.plan;
+  const pending = p.copy + p.meta + p.move + p.orphans;
+  if (!pending) return { done: true, text: `Archivio aggiornato in ${nas.root}.`, label: 'Apri' };
+  return {
+    done: false,
+    text: p.copy ? `${plural(p.copy, 'foto da copiare', 'foto da copiare')} in ${nas.root} (${bytes(p.bytes_to_copy)}).`
+      : `${plural(pending, 'modifica da riportare', 'modifiche da riportare')} sull’archivio in ${nas.root}.`,
+    label: p.skip ? 'Aggiorna l’archivio' : 'Crea l’archivio',
+  };
+}
+
+export async function renderOverview(el, ctx) {
   const s = ctx.state;
   const c = s.counts;
+  const nas = s.user ? await api.get('/api/nas').catch(() => null) : null;
+  const ns = nasStep(nas);
   const google = s.sources.filter((x) => x.type === 'google' || x.type === 'icloud').length;
   const devices = s.sources.length - google;
   const step = (n, done, title, text, action = '', later = false) => `
@@ -72,9 +88,148 @@ export function renderOverview(el, ctx) {
       ${step(5, false, 'Ordina e sistema',
         'Nella galleria seleziona le foto per escluderle, metterle tra le preferite, aggiungerle a un album, indicare le persone o correggere la data.',
         go('galleria', 'Apri la galleria'))}
-      ${step(6, false, 'Crea l’archivio sul NAS',
-        'Copia le foto incluse sul NAS, ordinate per anno ed evento, con tutti i dati scritti nei file. In arrivo nel prossimo aggiornamento.', '', true)}
+      ${step(6, ns.done, 'Crea l’archivio sul NAS', `${esc(ns.text)} Le foto sono ordinate per anno ed evento, con tutti i dati scritti nei file.`,
+        go('nas', ns.label, !ns.done && Boolean(s.user)))}
     </ol></div>`;
+}
+
+// ---------------------------------------------------------------- NAS archive
+
+const EXAMPLE_TREE = (root, user) => `<b>${esc(root || 'X:\\ArchivioFoto')}</b>
+└ ${esc(user || 'utente')}
+   ├ 2019
+   │  └ 2019-10-09 Gita al mare
+   │     ├ 2019-10-09_084004__DSC2630.jpg     data, luogo, persone e album dentro il file
+   │     └ 2019-10-09_091512_VID_0042.mp4
+   ├ senza-data                               foto di cui non si conosce la data
+   ├ _esclusi                                 foto tolte dopo un export precedente (mai cancellate)
+   └ _indice.csv                              elenco di tutti i file con le loro fonti, apribile in Excel`;
+
+export async function renderNas(el, ctx) {
+  const nas = await api.get('/api/nas');
+  const p = nas.plan;
+  const last = nas.last;
+  const pending = p ? p.copy + p.meta + p.move + p.orphans : 0;
+  const status = !nas.root ? '<p class="dest-status">Nessuna destinazione scelta.</p>'
+    : nas.exists ? `<p class="dest-status">${bytes(nas.free)} liberi sulla destinazione.</p>`
+      : `<p class="dest-status bad">La cartella non è raggiungibile: controlla che l’unità o il NAS sia collegato.</p>`;
+  const stats = p ? `<div class="overview-total">
+      <div><b>${num(p.copy)}</b><span>da copiare, ${bytes(p.bytes_to_copy)}</span></div>
+      <div><b>${num(p.meta + p.move)}</b><span>da aggiornare o spostare</span></div>
+      <div><b>${num(p.skip)}</b><span>già nell’archivio</span></div>
+      <div><b>${num(p.orphans)}</b><span>da spostare in _esclusi</span></div>
+    </div>` : '';
+  const action = !nas.exists ? ''
+    : `<div class="nas-actions">
+        <button class="btn btn-primary" type="button" data-export ${!pending || ctx.state.job.running || !nas.exiftool ? 'disabled' : ''}>
+          ${icon('i-refresh')}${!pending ? 'Archivio aggiornato' : p.skip ? 'Aggiorna l’archivio' : 'Crea l’archivio'}</button>
+        <button class="btn" type="button" data-open-nas>${icon('i-folder')}Apri la cartella</button>
+      </div>`;
+  const lastBlock = last ? `<h2 class="section-title">Ultimo aggiornamento</h2>
+    <p class="hint">${esc(last.finished_at)} in ${esc(last.root)}: copiati ${num(last.copy)}, aggiornati ${num(last.meta + last.move)},
+      spostati in _esclusi ${num(last.orphans)}${last.sidecars ? `, ${num(last.sidecars)} con i dati in un file .xmp accanto` : ''}.
+      ${last.n_errors ? `<b>${plural(last.n_errors, 'errore', 'errori')}:</b>` : 'Nessun errore.'}</p>
+    ${last.n_errors ? `<ul class="errors-list">${last.errors.map((e) => `<li>${esc(e)}</li>`).join('')}</ul>` : ''}` : '';
+
+  el.innerHTML = `<div class="page">
+    ${pageHead('Archivio sul NAS',
+      'La copia definitiva delle foto incluse, ordinate per anno ed evento, con data, luogo, persone, album ed etichette scritti dentro i file: leggibile da qualsiasi programma. Puoi aggiornarla quando vuoi, copia solo le novità.')}
+    <h2 class="section-title">Destinazione</h2>
+    <div class="dest">
+      <input id="nas-root" value="${esc(nas.root ?? '')}" placeholder="Per esempio X:\\ArchivioFoto oppure \\\\NAS\\foto" aria-label="Cartella dell’archivio" autocomplete="off" spellcheck="false">
+      <button class="btn" type="button" data-pick>${icon('i-folder')}Scegli…</button>
+      <button class="btn" type="button" data-save>Salva</button>
+    </div>
+    ${status}
+    ${nas.exiftool ? '' : '<p class="dest-status bad">Manca exiftool, necessario per scrivere i dati nei file: installalo con <code>winget install OliverBetz.ExifTool</code>.</p>'}
+    ${p ? `<h2 class="section-title">Cosa farà</h2>${stats}${action}` : ''}
+    <div class="jobpanel-slot"></div>
+    ${lastBlock}
+    <h2 class="section-title">Come sarà organizzato</h2>
+    <div class="tree">${EXAMPLE_TREE(nas.root, ctx.user)}</div>
+  </div>`;
+  renderJobPanel(el.querySelector('.jobpanel-slot'), ctx.state.job);
+
+  const input = el.querySelector('#nas-root');
+  async function save(root) {
+    try {
+      await api.post('/api/nas', { root });
+    } catch (err) {
+      if (!/non esiste/.test(err.message)) { ctx.toast(err.message); return; }
+      if (!(await ctx.confirm('Creare la cartella?', `${root} non esiste ancora. La creo adesso?`, 'Crea'))) return;
+      try { await api.post('/api/nas', { root, create: true }); } catch (e2) { ctx.toast(e2.message); return; }
+    }
+    ctx.toast('Destinazione salvata');
+    renderNas(el, ctx);
+  }
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(input.value); });
+  el.onclick = async (e) => {
+    const t = e.target.closest('button');
+    if (!t) return;
+    try {
+      if ('save' in t.dataset) await save(input.value);
+      if ('pick' in t.dataset) {
+        t.disabled = true;
+        const { path } = await api.post('/api/pick-folder');
+        t.disabled = false;
+        if (path) { input.value = path; await save(path); }
+      }
+      if ('openNas' in t.dataset) await api.post('/api/open-nas');
+      if ('export' in t.dataset) { t.disabled = true; await ctx.startJob('/api/export'); }
+    } catch (err) {
+      t.disabled = false;
+      ctx.toast(err.message);
+    }
+  };
+}
+
+// ---------------------------------------------------------------- events
+
+function eventRange(ev) {
+  const a = ev.start_local.slice(0, 10);
+  const b = ev.end_local.slice(0, 10);
+  return a === b ? dateTime(ev.start_local) : `dal ${dateTime(ev.start_local)} al ${dateTime(ev.end_local)}`;
+}
+
+export async function renderEvents(el, ctx) {
+  const { events } = await api.get(`/api/events?${q({ user: ctx.user })}`);
+  const row = (ev) => `
+    <div class="event" data-event="${ev.id}">
+      <button class="thumb" type="button" data-goto="${esc(ev.start_local)}" aria-label="Mostra nella galleria">
+        ${ev.cover ? `<img src="${thumbUrl(ev.cover, ev.v)}" alt="" loading="lazy">` : ''}</button>
+      <div>
+        <h3 class="${ev.name ? '' : 'unnamed'}">${esc(ev.name || 'Senza nome')}</h3>
+        <p>${esc(eventRange(ev))}, ${plural(ev.n_assets, 'elemento', 'elementi')}${ev.name_source === 'album' ? ', nome preso dall’album' : ''}</p>
+      </div>
+      <div class="tools"><button class="btn" type="button" data-rename>${ev.name ? 'Rinomina' : 'Dai un nome'}</button></div>
+    </div>`;
+  el.innerHTML = `<div class="page">
+    ${pageHead('Eventi',
+      'Le foto vicine nel tempo e nello spazio formano un evento: una gita, una festa, una giornata al mare. Il nome diventa la cartella dell’archivio, per esempio “2019-10-09 Gita al mare”.')}
+    <div class="list">${events.length ? events.map(row).join('') : emptyBlock('Nessun evento', 'Gli eventi compaiono dopo il primo aggiornamento dell’archivio.')}</div>
+  </div>`;
+  el.onclick = async (e) => {
+    const t = e.target.closest('button');
+    if (!t) return;
+    const rowEl = t.closest('[data-event]');
+    const ev = rowEl && events.find((x) => x.id === Number(rowEl.dataset.event));
+    if (t.dataset.goto) { ctx.gotoDate(t.dataset.goto); return; }
+    if ('rename' in t.dataset && ev) {
+      const name = await ctx.ask({
+        title: 'Nome dell’evento', text: eventRange(ev), label: 'Nome', value: ev.name ?? '', confirm: 'Salva',
+        hint: 'Lascia vuoto per tornare al nome automatico.', allowEmpty: true,
+      });
+      if (name === null) return;
+      try {
+        await api.post(`/api/events/${ev.id}/rename`, { name });
+        ctx.galleryChanged();
+        await ctx.refresh();
+        renderEvents(el, ctx);
+      } catch (err) {
+        ctx.toast(err.message);
+      }
+    }
+  };
 }
 
 // ---------------------------------------------------------------- duplicates

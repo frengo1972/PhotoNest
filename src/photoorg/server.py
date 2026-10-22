@@ -10,9 +10,11 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import socket
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -30,7 +32,8 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from photoorg import catalog, dedup, edits
+from photoorg import catalog, dedup, edits, events, export
+from photoorg.exiftool import find as find_exiftool
 from photoorg.ingest import ingest
 from photoorg.library import Library
 from photoorg.normalize import normalize
@@ -127,6 +130,20 @@ def _scan(job: Job, work: Path, income: Path, tz: str, library: Library) -> None
         job.log(f"Anteprime preparate: {made}")
 
 
+def _export(job: Job, work: Path, root: str, library: Library) -> None:
+    with closing(catalog.connect(work)) as conn:
+        job.set_phase("Copia sul NAS")
+        export.run(conn, root, library, log=job.log, progress=job.progress)
+
+
+PICK_FOLDER = (  # runs in its own process: Tk must own its thread
+    "import sys, tkinter as tk\nfrom tkinter import filedialog\n"
+    "r = tk.Tk(); r.withdraw(); r.attributes('-topmost', True)\n"
+    "p = filedialog.askdirectory(title='Scegli la cartella dell\\'archivio', initialdir=sys.argv[1] or None, mustexist=False)\n"
+    "sys.stdout.buffer.write((p or '').encode('utf-8'))\n"
+)
+
+
 def _dims(r: sqlite3.Row) -> tuple[int | None, int | None]:
     w, h = r["width"], r["height"]
     return (h, w) if r["orientation"] in SWAPPED_ORIENTATIONS else (w, h)
@@ -176,6 +193,15 @@ class TagEdit(BaseModel):
 class VariantKeep(BaseModel):
     group: int
     keep: list[int]
+
+
+class NasSettings(BaseModel):
+    root: str
+    create: bool = False
+
+
+class EventRename(BaseModel):
+    name: str | None = None
 
 
 class Decision(BaseModel):
@@ -228,6 +254,7 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
             variants_todo = conn.execute(
                 f"SELECT count(*) FROM ({VARIANT_GROUPS} HAVING {VARIANT_TODO})", (user,)
             ).fetchone()[0]
+            n_events = conn.execute("SELECT count(*) FROM events WHERE user = ?", (user,)).fetchone()[0]
             sources = [dict(r) for r in conn.execute(
                 "SELECT s.id, s.user, s.type, s.ident, count(i.id) items, coalesce(sum(i.kind = 'image'), 0) photos, "
                 "coalesce(sum(i.kind = 'video'), 0) videos, coalesce(sum(i.kind = 'raw'), 0) raw, "
@@ -239,7 +266,8 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
         found, warnings = discover_sources(income)
         pending = [{"user": s.user, "type": s.type, "ident": s.ident} for s in found if (s.user, s.type, s.ident) not in known]
         return {
-            "users": users, "user": user, "counts": {**dict(counts), "issues": issues, "variants_todo": variants_todo},
+            "users": users, "user": user,
+            "counts": {**dict(counts), "issues": issues, "variants_todo": variants_todo, "events": n_events},
             "sources": sources, "pending": pending, "warnings": warnings,
             "income": str(income.resolve()), "job": job.snapshot(),
         }
@@ -430,6 +458,104 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
     @app.get("/api/job")
     def job_state() -> dict:
         return job.snapshot()
+
+    # ---------- NAS archive ----------
+
+    def nas_status(conn: sqlite3.Connection) -> dict:
+        root = catalog.get_setting(conn, export.SETTING_ROOT)
+        status = {"root": root, "exiftool": bool(find_exiftool()), "last": export.last_summary(conn),
+                  "exists": False, "free": None, "plan": None}
+        if root and Path(root).is_dir():
+            status["exists"] = True
+            status["free"] = shutil.disk_usage(root).free
+            status["plan"] = export.plan(conn, root).summary()
+        return status
+
+    @app.get("/api/nas")
+    def nas() -> dict:
+        with db() as conn:
+            return nas_status(conn)
+
+    @app.post("/api/nas")
+    def nas_save(body: NasSettings) -> dict:
+        root = export.normalize_root(body.root) if body.root.strip() else ""
+        if not root:
+            raise HTTPException(400, "indica una cartella")
+        path = Path(root)
+        if not path.anchor or not Path(path.anchor).exists():
+            raise HTTPException(400, f"unità o percorso di rete non raggiungibile: {path.anchor or root}")
+        if path == Path(path.anchor):
+            raise HTTPException(400, "scegli una cartella dedicata, non la radice dell’unità")
+        if not path.is_dir():
+            if not body.create:
+                raise HTTPException(404, "la cartella non esiste")
+            path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".photoorg-probe"
+        try:
+            probe.write_text("ok")
+            probe.unlink()
+        except OSError as ex:
+            raise HTTPException(400, f"la cartella non è scrivibile: {ex}") from ex
+        with db() as conn:
+            catalog.set_setting(conn, export.SETTING_ROOT, root)
+            return nas_status(conn)
+
+    @app.post("/api/pick-folder")
+    def pick_folder() -> dict:
+        with db() as conn:
+            start = catalog.get_setting(conn, export.SETTING_ROOT) or ""
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        out = subprocess.run([sys.executable, "-c", PICK_FOLDER, start], capture_output=True, timeout=600, creationflags=flags)
+        chosen = out.stdout.decode("utf-8", "replace").strip()
+        return {"path": export.normalize_root(chosen) if chosen else None}
+
+    @app.post("/api/export")
+    def start_export() -> dict:
+        with db() as conn:
+            root = catalog.get_setting(conn, export.SETTING_ROOT)
+        if not root:
+            raise HTTPException(400, "scegli prima la cartella dell’archivio")
+        if not find_exiftool():
+            raise HTTPException(400, "exiftool non trovato: installalo con 'winget install OliverBetz.ExifTool'")
+        if not job.start(lambda j: _export(j, work, root, library)):
+            raise HTTPException(409, "un’operazione è già in corso")
+        return job.snapshot()
+
+    @app.post("/api/open-nas")
+    def open_nas() -> dict:
+        with db() as conn:
+            root = catalog.get_setting(conn, export.SETTING_ROOT)
+        if not root or not Path(root).is_dir():
+            raise HTTPException(404, "cartella dell’archivio non disponibile")
+        os.startfile(root)  # noqa: S606 - folder chosen by the user
+        return {"ok": True}
+
+    # ---------- events ----------
+
+    @app.get("/api/events")
+    def list_events(user: str) -> dict:
+        with db() as conn:
+            rows = conn.execute(  # cover: favourite first, then the sharpest photo of the event
+                "SELECT e.*, c.id AS cover_id, c.sha256 AS cover_sha FROM events e "
+                "LEFT JOIN items c ON c.id = (SELECT i.id FROM event_assets ea JOIN assets a ON a.id = ea.asset_id "
+                "  JOIN items i ON i.id = a.winner_id WHERE ea.event_id = e.id AND a.kind = 'image' "
+                "  ORDER BY a.favorite DESC, i.sharpness DESC LIMIT 1) "
+                "WHERE e.user = ? ORDER BY e.start_local DESC", (user,)
+            ).fetchall()
+        return {"events": [
+            {**{k: r[k] for k in ("id", "start_local", "end_local", "n_assets", "name", "name_source")},
+             "cover": r["cover_id"], "v": (r["cover_sha"] or "")[:12]}
+            for r in rows
+        ]}
+
+    @app.post("/api/events/{event_id}/rename")
+    def rename_event(event_id: int, body: EventRename) -> dict:
+        with db() as conn:
+            try:
+                events.rename(conn, event_id, body.name)
+            except ValueError as ex:
+                raise HTTPException(404, str(ex)) from ex
+        return {"ok": True}
 
     @app.post("/api/open-income")
     def open_income() -> dict:

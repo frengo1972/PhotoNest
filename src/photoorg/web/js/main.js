@@ -5,7 +5,8 @@ import { esc, icon, num, plural } from './format.js';
 import { Gallery } from './gallery.js';
 import { Lightbox } from './lightbox.js';
 import {
-  renderDuplicates, renderIssues, renderJobPanel, renderOverview, renderSources, renderTrash, renderVariants,
+  renderDuplicates, renderEvents, renderIssues, renderJobPanel, renderNas, renderOverview, renderSources, renderTrash,
+  renderVariants,
 } from './views.js';
 
 const $ = (s) => document.querySelector(s);
@@ -27,7 +28,15 @@ const ctx = {
   toast,
   markPending: () => { $('#pending').hidden = false; },
   galleryChanged: () => { galleryStale = true; },
+  ask: (opts) => ask(opts),
+  confirm: (title, text, confirmLabel) => ask({ title, text, confirm: confirmLabel }),
+  startJob: (url) => startJob(url),
+  gotoDate: (date) => {
+    pendingDate = date;
+    if (location.hash === '#/galleria') route(); else location.hash = '#/galleria';
+  },
 };
+let pendingDate = null;
 
 let galleryUser = null;
 let galleryStale = false;
@@ -209,25 +218,34 @@ $('#selbar').addEventListener('click', async (e) => {
 
 // ---------- dialog ----------
 
-/** Small modal form with one field. Resolves with the value, or null if cancelled. */
-function ask({ title, text = '', label, hint = '', type = 'text', list = '', value = '', confirm }) {
+/**
+ * Small modal. With `label` it asks for one value and resolves with it (null if cancelled; "" only
+ * with allowEmpty). Without `label` it is a confirmation and resolves true / false.
+ */
+function ask({ title, text = '', label = null, hint = '', type = 'text', list = '', value = '', confirm, allowEmpty = false }) {
   const d = $('#sheet');
   d.querySelector('h2').textContent = title;
   d.querySelector('.sheet-text').textContent = text;
-  d.querySelector('.sheet-body').innerHTML = `<div class="field">
+  d.querySelector('.sheet-body').innerHTML = label === null ? '' : `<div class="field">
     <label for="sheet-input">${esc(label)}</label>
     <input id="sheet-input" type="${type}" ${type === 'datetime-local' ? 'step="1"' : ''} ${list ? `list="${list}"` : ''} value="${esc(value)}" autocomplete="off">
     ${hint ? `<small>${esc(hint)}</small>` : ''}</div>`;
-  d.querySelector('button[value="ok"]').textContent = confirm;
+  const ok = d.querySelector('button[value="ok"]');
+  ok.textContent = confirm;
   const input = d.querySelector('#sheet-input');
-  input.addEventListener('keydown', (e) => {
+  input?.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); d.close('ok'); } // Enter confirms (not the first button)
   });
   d.returnValue = '';
   d.showModal();
-  input.focus();
+  (input ?? ok).focus();
   return new Promise((resolve) => {
-    d.addEventListener('close', () => resolve(d.returnValue === 'ok' && input.value.trim() ? input.value.trim() : null), { once: true });
+    d.addEventListener('close', () => {
+      const confirmed = d.returnValue === 'ok';
+      if (!input) { resolve(confirmed); return; }
+      const v = input.value.trim();
+      resolve(confirmed && (v || allowEmpty) ? v : null);
+    }, { once: true });
   });
 }
 
@@ -235,11 +253,13 @@ function ask({ title, text = '', label, hint = '', type = 'text', list = '', val
 
 const SCREENS = {
   panoramica: renderOverview,
+  eventi: renderEvents,
   duplicati: renderDuplicates,
   varianti: renderVariants,
   verifica: renderIssues,
   cestino: renderTrash,
   fonti: renderSources,
+  nas: renderNas,
 };
 
 async function route() {
@@ -260,6 +280,7 @@ async function route() {
       if (galleryUser !== ctx.user || galleryStale) await loadGallery();
       gallery.shown();
       main.scrollTop = galleryScroll;
+      if (pendingDate) { gallery.scrollToDate(pendingDate); pendingDate = null; }
     } else {
       galleryView.hidden = true;
       otherView.hidden = false;
@@ -293,6 +314,12 @@ function toast(text, { action, onAction } = {}) {
 // ---------- scan ----------
 
 let polling = false;
+let jobKind = 'scan';
+const JOB_DONE = {
+  scan: ['Archivio aggiornato', 'Aggiornamento non riuscito: i dettagli sono in Fonti'],
+  export: ['Archivio sul NAS aggiornato', 'Copia sul NAS non riuscita: i dettagli sono in Archivio NAS'],
+};
+
 async function pollJob() {
   if (polling) return;
   polling = true;
@@ -302,7 +329,7 @@ async function pollJob() {
       job = await api.get('/api/job');
       ctx.state.job = job;
       renderJobMini(job);
-      if (ctx.current === 'fonti') renderJobPanel($('.jobpanel-slot'), job);
+      if (ctx.current === 'fonti' || ctx.current === 'nas') renderJobPanel($('.jobpanel-slot'), job);
       if (!job.running) break;
       await sleep(700);
     }
@@ -310,22 +337,27 @@ async function pollJob() {
     galleryStale = true;
     loadNames();
     await route();
-    toast(job.error ? 'Aggiornamento non riuscito: i dettagli sono in Fonti' : 'Archivio aggiornato');
+    const [ok, failed] = JOB_DONE[jobKind] ?? JOB_DONE.scan;
+    toast(job.error ? failed : ok);
   } finally {
     polling = false;
   }
 }
 
-async function startScan() {
+/** Start a background operation (scan or export) and follow its progress. */
+async function startJob(url) {
+  jobKind = url.includes('export') ? 'export' : 'scan';
   try {
-    ctx.state.job = await api.post('/api/scan');
+    ctx.state.job = await api.post(url);
     renderJobMini(ctx.state.job);
-    if (ctx.current === 'fonti' || ctx.current === 'panoramica') await route();
+    if (['fonti', 'panoramica', 'nas'].includes(ctx.current)) await route();
     pollJob();
   } catch (err) {
     toast(err.message);
   }
 }
+
+const startScan = () => startJob('/api/scan');
 
 // ---------- global events ----------
 

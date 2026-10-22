@@ -336,6 +336,14 @@ export class Gallery {
 
   // ---------- viewer hand-off ----------
 
+  /** Scroll to the first day on or before `date` ("YYYY-MM-DD ..."): the timeline runs newest first. */
+  scrollToDate(date) {
+    const key = date.slice(0, 10);
+    const day = this.days.find((d) => d.key <= key) ?? this.days.at(-1);
+    if (day) this.scroller.scrollTop = day.top - this.head.offsetHeight;
+    this.updateHead();
+  }
+
   tileFor(idx) {
     return this.tiles.get(idx) ?? null;
   }
