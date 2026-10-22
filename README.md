@@ -1,0 +1,90 @@
+# Photo Consolidator
+
+Tool per consolidare foto e video sparsi su più account Google Photos, telefoni Android e iPhone
+in un **archivio unico, ordinato, per utente**, conservando tutti i metadati (data, GPS, persone, descrizioni, album).
+
+## Obiettivo
+
+- Recuperare tutto: Google Takeout di ogni account + copia completa dei telefoni.
+- Ripristinare i metadati che Takeout tiene nei `.json` separati, scrivendoli in EXIF/XMP.
+- Eliminare i duplicati (anche ricompressi da "Risparmio spazio" o convertiti HEIC→JPEG) senza perdere metadati.
+- Ordinare per utente / anno / evento e taggare (eventi, persone, oggetti) con modelli locali.
+- Archivio finale su NAS QNAP: cartelle + XMP, leggibile da qualunque software (Immich, digiKam, QuMagie...).
+
+## Struttura
+
+```
+income/     file grezzi da smistare (zip Takeout, copie telefoni). Mai modificati dal tool.
+docs/       istruzioni, architettura, decisioni
+work/       (generata) catalogo SQLite, miniature, report. Ricostruibile.
+src/        codice Python (src/photoorg) e interfaccia web (src/photoorg/web)
+```
+
+## Uso
+
+Doppio clic sull'icona **Archivio foto** sul desktop: si apre l'app in una finestra propria.
+Da lì si fa tutto: la **Panoramica** elenca i passi e quanto resta da fare; *Aggiorna archivio* legge le fonti nuove.
+Chiusa la finestra, il server locale si spegne da solo dopo qualche minuto.
+
+| Schermata | Cosa fa |
+|---|---|
+| Panoramica | i passi da fare, con quanti elementi restano per ciascuno |
+| Galleria | foto per giorno; − / + o Ctrl+rotellina per la dimensione delle anteprime; clic = visualizzatore |
+| Duplicati | confronto affiancato delle copie; *Tieni questa*, *Non è un duplicato*, *Va bene così*, poi *Applica* |
+| Raffiche | scatti nello stesso secondo: *Tieni solo questa* (la più nitida è segnata) o *Tienile tutte* |
+| Date da verificare | date incoerenti o mancanti, con la spiegazione; correzione sul posto |
+| Cestino | foto escluse dall'archivio, *Rimetti* per recuperarle |
+| Fonti | account e telefoni letti, avanzamento dell'aggiornamento, cartella income |
+
+**Azioni** — nessuna tocca gli originali in income; "escludere" significa non copiare nell'archivio finale.
+
+| Dove | Come |
+|---|---|
+| Galleria | clic sul cerchio di una foto (o Ctrl+clic, Maiusc+clic per un intervallo, Ctrl+A tutte) → barra in basso: *Preferite*, *Album*, *Persone*, *Etichette*, *Data*, *Escludi* |
+| Visualizzatore | ← → o trascina per sfogliare, trascina in basso o Esc per chiudere, clic per zoom 1:1; `F` preferita, `Canc` escludi, `I` informazioni: lì si correggono data, album, persone, etichette |
+| Ovunque | dopo un'esclusione compare *Annulla* |
+
+Le modifiche sono salvate per contenuto (sha256): restano valide dopo ogni aggiornamento, anche se arriva una copia migliore della stessa foto.
+
+Prima installazione (una volta, prerequisiti in [docs/setup.md](docs/setup.md)):
+
+```powershell
+uv sync                     # crea l'ambiente Python 3.12
+uv run photoorg shortcut    # crea l'icona "Archivio foto" sul desktop
+```
+
+Riga di comando (facoltativa, per automazioni e test):
+
+```powershell
+uv run photoorg             # apre l'app (come l'icona)
+uv run photoorg scan        # aggiornamento completo con riepilogo testuale
+uv run pytest               # test
+```
+
+`scan` è incrementale: rilanciato, rielabora solo file nuovi o cambiati. Il catalogo è in `work/catalog.db`
+(SQLite, apribile con DB Browser for SQLite); cancellando `work/` si riparte da zero senza perdere nulla.
+
+| Comando | Fase | Cosa fa |
+|---|---|---|
+| `ingest` | 2 | legge zip e cartelle, abbina i JSON di Takeout, calcola sha256/pHash, legge EXIF |
+| `normalize` | 3 | sceglie data (EXIF › nome file › Google › mtime), fuso, GPS, descrizione, coppie Live/Motion |
+| `dedup` | 4 | raggruppa le copie in foto uniche, sceglie la migliore, unisce i metadati |
+| `report` | — | fonti, copertura metadati, elementi da verificare, riepilogo duplicati |
+| `app` | — | l'app (server locale su 127.0.0.1 + finestra Edge); anteprime in `work/cache` |
+| `shortcut` | — | crea l'icona sul desktop |
+
+## Documentazione
+
+| Documento | Contenuto |
+|---|---|
+| [docs/architettura.md](docs/architettura.md) | Pipeline, scelte tecniche, regole di dedup |
+| [docs/setup.md](docs/setup.md) | Strumenti da installare sul PC |
+| [docs/takeout.md](docs/takeout.md) | Export Google Photos passo passo |
+| [docs/android.md](docs/android.md) | Copia foto da telefono Android |
+| [docs/iphone.md](docs/iphone.md) | Copia foto da iPhone / iCloud |
+| [income/README.md](income/README.md) | Come organizzare i file in ingresso |
+
+## Regola d'oro
+
+**Non cancellare nulla** da account Google, telefoni o iCloud finché l'archivio finale non è
+verificato e con backup. Il tool non cancella mai: sposta in quarantena e produce report.

@@ -1,0 +1,13 @@
+# Dati personali: mai in git
+income/*
+!income/README.md
+work/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Locali
+*.log

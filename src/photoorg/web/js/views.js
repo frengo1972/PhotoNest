@@ -1,0 +1,489 @@
+// Screens other than the gallery: overview, duplicates, bursts, dates to check, trash, sources.
+// Each render(el, ctx) owns `el` until the next route change.
+
+import { api, q, thumbUrl } from './api.js';
+import {
+  DATE_SOURCE, REASON, SOURCE, bytes, dateTime, esc, icon, issueSentences, num, plural, sourceLabel, timeOf,
+} from './format.js';
+import { copyRow } from './lightbox.js';
+
+const PAGE = 20;
+
+const listJoin = (items) => (items.length < 2 ? items.join('') : `${items.slice(0, -1).join(', ')} e ${items.at(-1)}`);
+
+function pageHead(title, text, tools = '') {
+  return `<header class="page-head"><div><h1>${title}</h1><p>${text}</p></div>${tools ? `<div class="tools">${tools}</div>` : ''}</header>`;
+}
+
+const emptyBlock = (title, text, actions = '') =>
+  `<div class="empty"><h2>${title}</h2><p>${text}</p>${actions ? `<div class="actions">${actions}</div>` : ''}</div>`;
+
+/** Viewer entry for an item row returned by the API. */
+function entryOf(m, extra = {}) {
+  return { item: m.id, v: m.v, w: m.w, h: m.h, kind: m.kind, date: m.date_local, ...extra };
+}
+
+/** Viewer origin for a list of entries shown by `tiles` (same order). */
+const originOf = (entries, tiles) => ({ tile: (e) => tiles[entries.indexOf(e)] ?? null });
+
+const seg = (attr, value, label, on) => `<button type="button" data-${attr}="${value}" aria-pressed="${on}">${label}</button>`;
+
+// ---------------------------------------------------------------- overview
+
+export function renderOverview(el, ctx) {
+  const s = ctx.state;
+  const c = s.counts;
+  const google = s.sources.filter((x) => x.type === 'google' || x.type === 'icloud').length;
+  const devices = s.sources.length - google;
+  const step = (n, done, title, text, action = '', later = false) => `
+    <li class="step ${later ? 'later' : done ? 'done' : 'todo'}">
+      <span class="step-mark">${done && !later ? icon('i-check') : n}</span>
+      <h3>${title}</h3>${action}<p>${text}</p>
+    </li>`;
+  const go = (route, label, primary = false) => `<a class="btn ${primary ? 'btn-primary' : ''}" href="#/${route}">${label}</a>`;
+  const scanBtn = `<button class="btn ${s.pending.length ? 'btn-primary' : ''}" type="button" data-action="scan" ${s.job.running ? 'disabled' : ''}>${icon('i-refresh')}Aggiorna archivio</button>`;
+
+  el.innerHTML = `<div class="page">
+    ${pageHead('Panoramica',
+      s.user ? `L’archivio di ${esc(s.user)} si costruisce in pochi passi. Le scelte si possono cambiare in qualsiasi momento: gli originali non vengono mai toccati.`
+        : 'Per cominciare, aggiungi le foto da ordinare.')}
+    ${s.user ? `<div class="overview-total">
+      <div><b>${num(c.assets)}</b><span>foto e video nell’archivio</span></div>
+      <div><b>${num(c.copies)}</b><span>copie trovate nelle fonti</span></div>
+      <div><b>${num(c.excluded)}</b><span>nel cestino</span></div>
+    </div>` : ''}
+    <ol class="steps">
+      ${step(1, s.sources.length > 0 && !s.pending.length, 'Raccogli le foto',
+        s.pending.length ? `${plural(s.pending.length, 'cartella nuova', 'cartelle nuove')} da leggere nella cartella income.`
+          : s.sources.length ? `Lette ${plural(google, 'fonte cloud', 'fonti cloud')} e ${plural(devices, 'telefono o disco', 'telefoni o dischi')}. Aggiungine altre quando vuoi.`
+            : 'Metti nella cartella income gli zip di Google Takeout e le copie dei telefoni.',
+        s.pending.length || !s.sources.length ? scanBtn : go('fonti', 'Vedi le fonti'))}
+      ${step(2, s.user && !c.duplicates, 'Controlla i duplicati',
+        c.duplicates ? `${plural(c.duplicates, 'foto trovata', 'foto trovate')} in più versioni diverse: conferma quale copia tenere.`
+          : 'Nessun gruppo da controllare. Le copie identiche sono già unite.',
+        c.duplicates ? go('duplicati', 'Rivedi', true) : '')}
+      ${step(3, s.user && !c.variants_todo, 'Scegli tra le raffiche',
+        c.variants_todo ? `${plural(c.variants_todo, 'gruppo', 'gruppi')} di scatti fatti nello stesso secondo. Tieni il migliore o tienili tutti.`
+          : 'Nessuna raffica da scegliere.',
+        c.variants_todo ? go('varianti', 'Scegli', true) : '')}
+      ${step(4, s.user && !c.issues, 'Verifica le date',
+        c.issues ? `${plural(c.issues, 'foto ha', 'foto hanno')} date incoerenti o mancanti.` : 'Tutte le date sono coerenti.',
+        c.issues ? go('verifica', 'Correggi', true) : '')}
+      ${step(5, false, 'Ordina e sistema',
+        'Nella galleria seleziona le foto per escluderle, metterle tra le preferite, aggiungerle a un album, indicare le persone o correggere la data.',
+        go('galleria', 'Apri la galleria'))}
+      ${step(6, false, 'Crea l’archivio sul NAS',
+        'Copia le foto incluse sul NAS, ordinate per anno ed evento, con tutti i dati scritti nei file. In arrivo nel prossimo aggiornamento.', '', true)}
+    </ol></div>`;
+}
+
+// ---------------------------------------------------------------- duplicates
+
+function itemInfo(m) {
+  return `
+    <h2>${esc(m.filename)}</h2>
+    <p class="sub">${esc(sourceLabel(m.source.type))}, ${esc(m.source.ident)}</p>
+    <section><h3>Data</h3><p>${esc(dateTime(m.date_local))}</p><p class="sub">Ricavata ${esc(DATE_SOURCE[m.date_source] ?? 'da nessuna fonte')}.</p></section>
+    <section><h3>Questa copia</h3>${copyRow(m)}</section>
+    ${m.albums?.length ? `<section><h3>Album</h3><p>${esc(m.albums.join(', '))}</p></section>` : ''}
+    ${m.people?.length ? `<section><h3>Persone</h3><p>${esc(m.people.join(', '))}</p></section>` : ''}
+    <section><h3>Posizione</h3><p>${m.lat !== null ? `${m.lat.toFixed(5)}, ${m.lon.toFixed(5)}` : 'Nessuna'}</p></section>`;
+}
+
+function paneHtml(g, m, k, bestPixels) {
+  const kept = m.role === 'winner';
+  const pixels = (m.w || 0) * (m.h || 0);
+  const note = m.decision === 'winner' ? 'Hai scelto di tenere questa copia.'
+    : m.decision === 'separate' ? 'Hai indicato che non è un duplicato.' : '';
+  const actions = note
+    ? `<div class="pane-note">${esc(note)}<button class="btn btn-quiet" type="button" data-decide="clear" data-sha="${m.sha256}">Annulla</button></div>`
+    : m.reason === 'similar'
+      ? `<div class="pane-actions">
+           <button class="btn" type="button" data-decide="winner" data-sha="${m.sha256}">Tieni questa</button>
+           <button class="btn btn-quiet" type="button" data-decide="separate" data-sha="${m.sha256}">${icon('i-split')}Non è un duplicato</button>
+         </div>`
+      : '';
+  return `
+    <figure class="pane ${kept ? 'kept' : ''}">
+      <button class="pane-img" type="button" data-open="${k}" data-fit="contain" aria-label="Apri ${esc(m.filename)}">
+        <img src="${thumbUrl(m.id, m.v)}" alt="" loading="lazy">
+      </button>
+      <span class="pill ${kept ? 'kept' : ''}">${kept ? icon('i-check') : ''}${esc(REASON[m.reason] ?? m.reason)}</span>
+      <dl class="facts">
+        <dt>Fonte</dt><dd>${esc(sourceLabel(m.source.type))}<small>${esc(m.source.ident)}</small></dd>
+        <dt>File</dt><dd>${esc(m.filename)}</dd>
+        <dt>Dimensioni</dt><dd class="${g.n_contents > 1 && pixels === bestPixels ? 'best' : ''}">${m.w ? `${num(m.w)} × ${num(m.h)}` : '—'}</dd>
+        <dt>Peso</dt><dd>${bytes(m.size)}</dd>
+        <dt>Data</dt><dd>${esc(dateTime(m.date_local))}<small>${esc(DATE_SOURCE[m.date_source] ?? '')}</small></dd>
+        <dt>Posizione</dt><dd>${m.lat !== null ? 'Sì' : 'No'}</dd>
+        ${m.albums.length ? `<dt>Album</dt><dd>${esc(m.albums.join(', '))}</dd>` : ''}
+        ${m.people.length ? `<dt>Persone</dt><dd>${esc(m.people.join(', '))}</dd>` : ''}
+      </dl>
+      ${actions}
+    </figure>`;
+}
+
+function groupHtml(g) {
+  const best = Math.max(...g.members.map((m) => (m.w || 0) * (m.h || 0)));
+  const sources = [...new Set(g.members.map((m) => sourceLabel(m.source.type)))];
+  const tools = g.reviewed
+    ? `<span class="ok">${icon('i-check')}Controllato</span><button class="btn btn-quiet" type="button" data-review="0">Riapri</button>`
+    : `<button class="btn" type="button" data-review="1">${icon('i-check')}Va bene così</button>`;
+  return `
+    <article class="dgroup ${g.reviewed ? 'reviewed' : ''}" data-group="${g.id}">
+      <header class="dgroup-head">
+        <div><h3>${esc(dateTime(g.date_local))}</h3><p>${plural(g.n_items, 'copia', 'copie')} da ${esc(listJoin(sources))}</p></div>
+        <div class="tools">${tools}</div>
+      </header>
+      <div class="compare">${g.members.map((m, k) => paneHtml(g, m, k, best)).join('')}</div>
+    </article>`;
+}
+
+export async function renderDuplicates(el, ctx) {
+  const opts = (ctx.viewState.duplicati ??= { kind: 'simili', todo: true });
+  el.innerHTML = `<div class="page">
+    ${pageHead('Duplicati',
+      'Ogni gruppo è la stessa foto trovata più volte. La copia con il bordo blu entra nell’archivio, con i dati di tutte le altre (posizione, album, persone). Se va bene, premi Va bene così; altrimenti scegli un’altra copia.',
+      `<div class="segmented" role="group" aria-label="Tipo di copie">
+         ${seg('kind', 'simili', 'Simili', opts.kind === 'simili')}${seg('kind', 'identici', 'Identiche', opts.kind === 'identici')}
+       </div>
+       <div class="segmented" role="group" aria-label="Filtro">
+         ${seg('todo', '1', 'Da rivedere', opts.todo)}${seg('todo', '0', 'Tutti', !opts.todo)}
+       </div>`)}
+    <div class="list"></div><div class="more"></div></div>`;
+  const list = el.querySelector('.list');
+  const more = el.querySelector('.more');
+  const groups = new Map();
+  let offset = 0;
+
+  async function loadMore() {
+    const data = await api.get(`/api/groups?${q({ user: ctx.user, kind: opts.kind, todo: opts.todo, offset, limit: PAGE })}`);
+    if (!offset && !data.total) {
+      list.innerHTML = opts.kind === 'simili'
+        ? emptyBlock(opts.todo ? 'Nessun gruppo da rivedere' : 'Nessuna copia simile',
+          'Qui compaiono le foto presenti in più versioni diverse, per esempio una ricompressa da Google Foto e l’originale del telefono.')
+        : emptyBlock('Nessuna copia identica', 'Qui compaiono i file identici trovati in più fonti. Sono unificati automaticamente.');
+    }
+    for (const g of data.groups) groups.set(g.id, g);
+    list.insertAdjacentHTML('beforeend', data.groups.map(groupHtml).join(''));
+    offset += data.groups.length;
+    more.innerHTML = offset < data.total
+      ? `<button class="btn" type="button" data-more>Mostra altri ${num(Math.min(PAGE, data.total - offset))} di ${num(data.total - offset)}</button>` : '';
+  }
+
+  el.onclick = async (e) => {
+    const t = e.target.closest('button');
+    if (!t) return;
+    const art = t.closest('[data-group]');
+    const g = art && groups.get(Number(art.dataset.group));
+    try {
+      if (t.dataset.kind || t.dataset.todo) {
+        if (t.dataset.kind) opts.kind = t.dataset.kind;
+        if (t.dataset.todo) opts.todo = t.dataset.todo === '1';
+        return renderDuplicates(el, ctx);
+      }
+      if ('more' in t.dataset) { t.disabled = true; return await loadMore(); }
+      if (t.dataset.open !== undefined && g) {
+        const entries = g.members.map((m) => entryOf(m, {
+          caption: `${m.filename}, ${sourceLabel(m.source.type)}`, info: async () => itemInfo(m),
+        }));
+        return ctx.lightbox.open(entries, Number(t.dataset.open), originOf(entries, [...art.querySelectorAll('.pane-img')]));
+      }
+      if (t.dataset.decide && g) {
+        t.disabled = true;
+        await api.post('/api/decide', { sha: t.dataset.sha, action: t.dataset.decide, asset_id: g.id });
+        const m = g.members.find((x) => x.sha256 === t.dataset.sha);
+        m.decision = t.dataset.decide === 'clear' ? null : t.dataset.decide;
+        art.outerHTML = groupHtml(g);
+        ctx.markPending();
+        return;
+      }
+      if (t.dataset.review && g) {
+        t.disabled = true;
+        await api.post('/api/review', { asset_id: g.id, value: t.dataset.review === '1' });
+        g.reviewed = t.dataset.review === '1';
+        art.outerHTML = groupHtml(g);
+        ctx.refresh();
+      }
+    } catch (err) {
+      t.disabled = false;
+      ctx.toast(err.message);
+    }
+  };
+  await loadMore();
+}
+
+// ---------------------------------------------------------------- bursts / variants
+
+function sizeStrip(strip) {
+  const cells = [...strip.children];
+  const ratios = cells.map((c) => Number(c.dataset.ratio));
+  const width = strip.clientWidth - 6 * (ratios.length - 1);
+  const h = Math.min(260, width / ratios.reduce((a, r) => a + r, 0));
+  cells.forEach((c, k) => {
+    c.style.width = `${ratios[k] * h}px`;
+    c.querySelector('.shot').style.height = `${h}px`;
+  });
+}
+
+function variantHtml(g) {
+  const cells = g.items.map((m, k) => `
+    <div class="cell ${m.excluded ? 'excluded' : ''}" data-ratio="${(m.w && m.h ? m.w / m.h : 1.5).toFixed(4)}">
+      <button class="shot" type="button" data-open="${k}" aria-label="Apri ${esc(m.filename)}"><img src="${thumbUrl(m.id, m.v)}" alt="" loading="lazy"></button>
+      ${m.excluded ? `<span class="pill">${icon('i-trash')}Nel cestino</span>` : m.best && g.items.length > 1 ? `<span class="pill kept">${icon('i-check')}Più nitida</span>` : ''}
+      <span class="name">${esc(m.filename)}</span>
+      <div class="cell-actions">${m.excluded
+        ? `<button class="btn" type="button" data-restore="${m.asset}">${icon('i-restore')}Rimetti</button>`
+        : `<button class="btn" type="button" data-keep="${m.asset}">Tieni solo questa</button>`}</div>
+    </div>`).join('');
+  return `<article class="vgroup ${g.decided ? 'decided' : ''}" data-group="${g.group}">
+    <header class="vgroup-head"><h3>${esc(dateTime(g.date_local))}</h3>
+      <span class="muted">${plural(g.items.length, 'scatto', 'scatti')} alle ${esc(timeOf(g.date_local, true))}</span>
+      <div class="tools">${g.decided ? `<span class="ok">${icon('i-check')}Scelta fatta</span>`
+        : `<button class="btn" type="button" data-keep-all>${icon('i-check')}Tienile tutte</button>`}</div></header>
+    <div class="strip">${cells}</div>
+  </article>`;
+}
+
+export async function renderVariants(el, ctx) {
+  const opts = (ctx.viewState.varianti ??= { todo: true });
+  el.innerHTML = `<div class="page">
+    ${pageHead('Raffiche',
+      'Scatti fatti nello stesso secondo con la stessa fotocamera. Di solito basta il migliore: quello più nitido è già segnato. Gli altri finiscono nel cestino, da cui si possono rimettere.',
+      `<div class="segmented" role="group" aria-label="Filtro">
+         ${seg('todo', '1', 'Da scegliere', opts.todo)}${seg('todo', '0', 'Tutte', !opts.todo)}
+       </div>`)}
+    <div class="list"></div><div class="more"></div></div>`;
+  const list = el.querySelector('.list');
+  const more = el.querySelector('.more');
+  const groups = new Map();
+  let offset = 0;
+
+  async function loadMore() {
+    const data = await api.get(`/api/variants?${q({ user: ctx.user, todo: opts.todo, offset, limit: PAGE })}`);
+    if (!offset && !data.total) {
+      list.innerHTML = emptyBlock(opts.todo ? 'Nessuna raffica da scegliere' : 'Nessuna raffica', 'Qui compaiono gli scatti multipli fatti nello stesso secondo.');
+    }
+    for (const g of data.groups) groups.set(g.group, g);
+    list.insertAdjacentHTML('beforeend', data.groups.map(variantHtml).join(''));
+    for (const s of list.querySelectorAll('.strip')) sizeStrip(s);
+    offset += data.groups.length;
+    more.innerHTML = offset < data.total ? `<button class="btn" type="button" data-more>Mostra altri</button>` : '';
+  }
+
+  const ro = new ResizeObserver(() => { for (const s of list.querySelectorAll('.strip')) sizeStrip(s); });
+  ro.observe(list);
+  ctx.onLeave(() => ro.disconnect());
+
+  async function replaceGroup(art, g) {
+    if (opts.todo && g.decided) {
+      art.remove();
+      offset -= 1;
+    } else {
+      art.outerHTML = variantHtml(g);
+      const fresh = list.querySelector(`[data-group="${g.group}"] .strip`);
+      if (fresh) sizeStrip(fresh);
+    }
+    ctx.refresh();
+  }
+
+  el.onclick = async (e) => {
+    const t = e.target.closest('button');
+    if (!t) return;
+    if (t.dataset.todo) { opts.todo = t.dataset.todo === '1'; return renderVariants(el, ctx); }
+    if ('more' in t.dataset) { t.disabled = true; return loadMore(); }
+    const art = t.closest('[data-group]');
+    const g = art && groups.get(Number(art.dataset.group));
+    if (!g) return;
+    try {
+      if (t.dataset.open !== undefined) {
+        const entries = g.items.map((m) => entryOf(m, { asset: m.asset, excluded: m.excluded, caption: m.filename }));
+        return ctx.lightbox.open(entries, Number(t.dataset.open), originOf(entries, [...art.querySelectorAll('.shot')]));
+      }
+      if (t.dataset.keep || 'keepAll' in t.dataset) {
+        t.disabled = true;
+        const keep = t.dataset.keep ? [Number(t.dataset.keep)] : g.items.map((m) => m.asset);
+        await api.post('/api/variants/keep', { group: g.group, keep });
+        const dropped = g.items.filter((m) => !keep.includes(m.asset)).map((m) => m.asset);
+        for (const m of g.items) m.excluded = !keep.includes(m.asset);
+        g.decided = true;
+        await replaceGroup(art, g);
+        ctx.galleryChanged();
+        if (dropped.length) {
+          ctx.toast(`${plural(dropped.length, 'scatto messo', 'scatti messi')} nel cestino`, {
+            action: 'Annulla',
+            onAction: async () => { await api.post('/api/assets/edit', { ids: dropped, exclude: false }); ctx.galleryChanged(); renderVariants(el, ctx); },
+          });
+        }
+        return;
+      }
+      if (t.dataset.restore) {
+        t.disabled = true;
+        await api.post('/api/assets/edit', { ids: [Number(t.dataset.restore)], exclude: false });
+        g.items.find((m) => m.asset === Number(t.dataset.restore)).excluded = false;
+        await replaceGroup(art, g);
+        ctx.galleryChanged();
+      }
+    } catch (err) {
+      t.disabled = false;
+      ctx.toast(err.message);
+    }
+  };
+  await loadMore();
+}
+
+// ---------------------------------------------------------------- dates to check
+
+export async function renderIssues(el, ctx) {
+  const data = await api.get(`/api/issues?${q({ user: ctx.user })}`);
+  const items = data.items;
+  el.innerHTML = `<div class="page">
+    ${pageHead('Date da verificare',
+      'Foto in cui fotocamera, nome del file e Google Foto indicano date diverse, oppure nessuna data. È già stata scelta la più affidabile: se è giusta confermala, altrimenti correggila.')}
+    <div class="list">${items.length ? items.map((it, k) => `
+      <div class="issue" data-k="${k}">
+        <button class="thumb" type="button" data-open="${k}" aria-label="Apri ${esc(it.filename)}"><img src="${thumbUrl(it.id, it.v)}" alt="" loading="lazy"></button>
+        <div>
+          <h3>${esc(it.filename)}</h3>
+          ${issueSentences(it).map((s) => `<p>${s}</p>`).join('')}
+          <p class="used">${it.date_local ? `Data scelta: ${esc(dateTime(it.date_local))}, ${esc(DATE_SOURCE[it.date_source] ?? '')}.` : 'Senza una data, la foto finirà nella cartella “senza data”.'}</p>
+          <div class="fix">
+            <input type="datetime-local" step="1" value="${esc((it.date_local ?? '').replace(' ', 'T'))}" aria-label="Data e ora dello scatto">
+            <button class="btn btn-primary" type="button" data-save="${k}">Salva questa data</button>
+          </div>
+        </div>
+      </div>`).join('') : emptyBlock('Tutto in ordine', 'Nessuna foto con date incoerenti o mancanti.')}
+    </div></div>`;
+  el.onclick = async (e) => {
+    const t = e.target.closest('button');
+    if (!t) return;
+    if (t.dataset.open !== undefined) {
+      const entries = items.map((m) => entryOf(m, { asset: m.asset, caption: m.filename }));
+      ctx.lightbox.open(entries, Number(t.dataset.open), originOf(entries, [...el.querySelectorAll('.issue .thumb')]));
+      return;
+    }
+    if (t.dataset.save !== undefined) {
+      const row = t.closest('.issue');
+      const raw = row.querySelector('input').value;
+      if (!raw) { ctx.toast('Scegli una data prima di salvare'); return; }
+      t.disabled = true;
+      try {
+        await api.post('/api/assets/edit', { ids: [items[Number(t.dataset.save)].asset], date_local: raw.replace('T', ' ').padEnd(19, ':00').slice(0, 19) });
+        row.remove();
+        ctx.toast('Data salvata');
+        ctx.galleryChanged();
+        ctx.refresh();
+      } catch (err) {
+        t.disabled = false;
+        ctx.toast(err.message);
+      }
+    }
+  };
+}
+
+// ---------------------------------------------------------------- trash
+
+export async function renderTrash(el, ctx) {
+  const { items } = await api.get(`/api/timeline?${q({ user: ctx.user, excluded: true })}`);
+  el.innerHTML = `<div class="page">
+    ${pageHead('Cestino',
+      'Foto e video esclusi dall’archivio. Non vengono copiati sul NAS, ma restano nella cartella income: puoi rimetterli quando vuoi.',
+      items.length ? `<button class="btn" type="button" data-restore-all>${icon('i-restore')}Rimetti tutto</button>` : '')}
+    ${items.length ? `<div class="trash-grid">${items.map((it, k) => `
+      <div class="trash-cell" style="width:${Math.round(170 * Math.min(3, Math.max(0.5, it.w && it.h ? it.w / it.h : 1.5)))}px">
+        <button class="shot" type="button" data-open="${k}" aria-label="Apri"><img src="${thumbUrl(it.i, it.v)}" alt="" loading="lazy"></button>
+        <button class="btn restore" type="button" data-restore="${it.a}">${icon('i-restore')}Rimetti</button>
+      </div>`).join('')}</div>` : emptyBlock('Il cestino è vuoto', 'Le foto escluse dalla galleria, dalle raffiche o dal visualizzatore compaiono qui.')}
+  </div>`;
+  const entries = items.map((it) => ({ item: it.i, v: it.v, w: it.w, h: it.h, kind: it.k, date: it.d, asset: it.a, excluded: true }));
+  el.onclick = async (e) => {
+    const t = e.target.closest('button');
+    if (!t) return;
+    if (t.dataset.open !== undefined) {
+      ctx.lightbox.open(entries, Number(t.dataset.open), originOf(entries, [...el.querySelectorAll('.trash-cell .shot')]),
+        { removeWhen: (x) => !x.excluded });
+      return;
+    }
+    const ids = 'restoreAll' in t.dataset ? items.map((it) => it.a) : t.dataset.restore ? [Number(t.dataset.restore)] : null;
+    if (!ids) return;
+    t.disabled = true;
+    try {
+      await api.post('/api/assets/edit', { ids, exclude: false });
+      ctx.toast(`${plural(ids.length, 'elemento rimesso', 'elementi rimessi')} nell’archivio`);
+      ctx.galleryChanged();
+      await ctx.refresh();
+      renderTrash(el, ctx);
+    } catch (err) {
+      t.disabled = false;
+      ctx.toast(err.message);
+    }
+  };
+}
+
+// ---------------------------------------------------------------- sources
+
+export function renderJobPanel(slot, job) {
+  if (!slot) return;
+  if (!job.running && !job.finished_at) { slot.innerHTML = ''; return; }
+  const lines = job.lines.map((l) => `<li>${esc(l)}</li>`).join('');
+  if (job.running) {
+    const pct = job.total ? Math.round((100 * job.done) / job.total) : 0;
+    slot.innerHTML = `<div class="jobpanel" aria-live="polite">
+      <h3>${esc(job.phase ?? 'Avvio')}${job.total ? `, ${num(job.done)} di ${num(job.total)}` : ''}</h3>
+      <div class="bar ${job.total ? '' : 'indeterminate'}"><span style="width:${pct}%"></span></div>
+      <ol>${lines}</ol></div>`;
+    return;
+  }
+  const end = new Date(job.finished_at * 1000);
+  const secs = Math.max(1, Math.round(job.finished_at - job.started_at));
+  slot.innerHTML = `<div class="jobpanel">
+    <h3>${job.error ? 'Aggiornamento non riuscito' : 'Archivio aggiornato'}</h3>
+    <p class="muted">Terminato alle ${end.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' })}, in ${plural(secs, 'secondo', 'secondi')}.</p>
+    ${job.error ? `<p class="error">${esc(job.error)}</p>` : ''}
+    <ol>${lines}</ol></div>`;
+}
+
+function sourceRow(s) {
+  const meta = SOURCE[s.type] ?? SOURCE.altro;
+  const sidecarPct = s.type === 'google' && s.items ? `${Math.round((100 * s.sidecars) / s.items)}%` : '—';
+  return `<div class="source">
+    <span class="kind">${icon(meta.icon)}</span>
+    <div class="name"><b>${esc(meta.label)}</b><span>${esc(s.ident)}</span></div>
+    <div class="num">${num(s.photos + s.raw)}<small>foto</small></div>
+    <div class="num">${num(s.videos)}<small>video</small></div>
+    <div class="num">${sidecarPct}<small>con dati Google</small></div>
+    <div class="num">${bytes(s.bytes)}<small>${s.errors ? `${num(s.errors)} illeggibili` : 'spazio'}</small></div>
+  </div>`;
+}
+
+export function renderSources(el, ctx) {
+  const s = ctx.state;
+  const users = [...new Set(s.sources.map((x) => x.user))];
+  const sections = users.map((u) => `
+    <h2 class="section-title">Archivio di ${esc(u)}</h2>
+    ${s.sources.filter((x) => x.user === u).map(sourceRow).join('')}`).join('');
+  const pending = s.pending.length ? `
+    <h2 class="section-title">Da leggere</h2>
+    ${s.pending.map((p) => `<div class="source pending"><span class="kind">${icon((SOURCE[p.type] ?? SOURCE.altro).icon)}</span>
+      <div class="name"><b>${esc(sourceLabel(p.type))} di ${esc(p.user)}</b><span>${esc(p.ident)}</span></div></div>`).join('')}
+    <p class="hint">Queste cartelle sono nuove: premi Aggiorna archivio per leggerle.</p>` : '';
+  const warnings = s.warnings.length ? `
+    <h2 class="section-title">Cartelle non riconosciute</h2>
+    ${s.warnings.map((w) => `<p class="hint">${esc(w)}</p>`).join('')}` : '';
+  el.innerHTML = `<div class="page">
+    ${pageHead('Fonti',
+      'L’archivio legge le foto dalla cartella income senza modificarla. Per aggiungere un account Google o un telefono, mettine i file lì e aggiorna l’archivio.',
+      `<button class="btn" type="button" data-action="open-income">${icon('i-folder')}Apri la cartella income</button>
+       <button class="btn btn-primary" type="button" data-action="scan" ${s.job.running ? 'disabled' : ''}>${icon('i-refresh')}Aggiorna archivio</button>`)}
+    <div class="jobpanel-slot"></div>
+    ${sections || (pending ? '' : emptyBlock('Nessuna fonte', 'La cartella income è vuota.'))}
+    ${pending}
+    ${warnings}
+    <h2 class="section-title">Come aggiungere una fonte</h2>
+    <p class="hint">Dentro <code>${esc(s.income)}</code> crea una cartella per persona e, dentro, una per ogni fonte:
+      <code>google-indirizzo@gmail.com</code> per gli zip di Google Takeout (lasciali compressi),
+      <code>android-modello</code> o <code>iphone-modello</code> per la copia di un telefono,
+      <code>icloud-indirizzo</code> per iCloud, <code>altro-descrizione</code> per dischi e chiavette.</p>
+  </div>`;
+  renderJobPanel(el.querySelector('.jobpanel-slot'), s.job);
+}
