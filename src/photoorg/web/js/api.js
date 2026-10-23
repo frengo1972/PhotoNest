@@ -20,6 +20,8 @@ export const api = {
 export const q = (params) =>
   new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined && v !== null)).toString();
 
-export const thumbUrl = (id, v) => `/media/thumb/${id}?v=${v}`;
+// t=2: video thumbnails became frame sheets (the old placeholder is cached forever)
+export const thumbUrl = (id, v) => `/media/thumb/${id}?v=${v}&t=2`;
 export const fullUrl = (id, v) => `/media/full/${id}?v=${v}`;
 export const fileUrl = (id) => `/media/file/${id}`;
+export const versionUrl = (id, size, v) => `/media/version/${id}/${size}?v=${v}`;

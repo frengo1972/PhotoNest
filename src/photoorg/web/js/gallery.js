@@ -8,7 +8,7 @@
 // Keyboard: arrows move a cursor across the layout (Shift extends), PgUp/PgDn a screen, Home/End,
 // Space selects, Enter opens. Zoom: − / + or Ctrl+wheel.
 
-import { api, thumbUrl } from './api.js';
+import { api, thumbUrl, versionUrl } from './api.js';
 import {
   DATE_SOURCE, bytes, dayTitle, esc, icon, megapixels, monthTitle, num, plural, sourceLabel, timeOf, tzLabel,
 } from './format.js';
@@ -399,10 +399,11 @@ export class Gallery {
       b.tabIndex = idx === focusable ? 0 : -1;
       b.setAttribute('aria-pressed', String(this.selected.has(idx)));
       b.setAttribute('aria-label', `${it.k === 'video' ? 'Video' : 'Foto'} di ${day.label}`);
-      const media = `<img alt="" decoding="async" loading="lazy" draggable="false" src="${thumbUrl(it.i, it.v)}">`
+      const media = `<img alt="" decoding="async" loading="lazy" draggable="false" src="${it.r ? versionUrl(it.r, 'thumb', it.rv) : thumbUrl(it.i, it.v)}">`
         + `<span class="sel" title="Seleziona">${icon('i-check')}</span>`
         + (it.k === 'video' ? `<span class="badge video">${icon('i-play')}</span>` : '')
         + (it.f ? `<span class="badge fav" title="Preferita">${icon('i-star')}</span>` : '')
+        + (it.r ? `<span class="badge retouched" title="Ritoccata">${icon('i-wand')}</span>` : '')
         + (it.n > 1 ? `<span class="badge copies" title="Unita da ${it.n} copie">${icon('i-copies')}${it.n}</span>` : '');
       b.innerHTML = list
         ? `<span class="thumb" data-fit="contain">${media}</span><span class="meta">${this.metaHtml(idx)}</span>`

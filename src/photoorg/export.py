@@ -8,6 +8,7 @@ Safe and incremental:
 - every copy is verified against the catalog sha256 before it gets its final name;
 - metadata (date, time zone, GPS, people, albums, keywords, event, favourite, description) is written
   into the copy with exiftool; formats exiftool cannot write get an XMP sidecar (<file>.xmp);
+- a retouched photo also gets its newest version next to the original (<name>_ritoccata.jpg), same metadata;
 - a second export copies only new photos, rewrites changed metadata and moves files whose folder changed;
 - nothing on the NAS is deleted: photos excluded later, and older copies replaced by better ones,
   are moved to <root>/<user>/_esclusi/.
@@ -30,7 +31,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from photoorg import catalog, events
+from photoorg import catalog, events, versions
 from photoorg.exiftool import ExifTool, find as find_exiftool
 from photoorg.library import Library
 
@@ -40,6 +41,7 @@ SETTING_LAST = "last_export"
 EXCLUDED_DIR = "_esclusi"
 INDEX_NAME = "_indice.csv"
 NO_DATE_DIR = "senza-data"
+RETOUCHED_SUFFIX = "_ritoccata"
 # exiftool writes these in place; everything else (RAW, AVI, MKV, BMP, Motion Photo .MP...) gets a sidecar
 IN_PLACE = {".jpg", ".jpeg", ".heic", ".heif", ".png", ".tif", ".tiff", ".webp", ".gif", ".mp4", ".mov", ".m4v", ".3gp"}
 _INVALID = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -64,6 +66,15 @@ class Planned:
     meta_hash: str
     action: str                          # copy | replace | meta | move | skip
     prev: sqlite3.Row | None = None      # exported row of this content (meta/move/skip) or of an older copy (replace)
+    version: sqlite3.Row | None = None   # set for the retouched version of the asset, copied next to the original
+
+    @property
+    def sha(self) -> str:
+        return (self.version or self.asset)["sha256"]
+
+    @property
+    def size(self) -> int:
+        return (self.version or self.asset)["size"]
 
 
 @dataclass
@@ -77,7 +88,7 @@ class Plan:
 
     @property
     def bytes_to_copy(self) -> int:
-        return sum(p.asset["size"] for p in self.items if p.action in ("copy", "replace"))
+        return sum(p.size for p in self.items if p.action in ("copy", "replace"))
 
     def summary(self) -> dict:
         return {
@@ -178,8 +189,29 @@ def plan(conn: sqlite3.Connection, root: str) -> Plan:
     ):
         members[asset_id].add(sha)
     exported = {(r["user"], r["sha256"]): r for r in conn.execute("SELECT * FROM exported WHERE root = ?", (root,))}
+    retouched = versions.for_assets(conn)
     claimed: set[tuple[str, str]] = set()
     used: set[str] = set()
+
+    def unique(rel_dir: str, name: str, ext: str) -> str:
+        rel, n = f"{rel_dir}/{name}{ext}", 2
+        while rel.lower() in used:
+            rel = f"{rel_dir}/{name}_{n}{ext}"
+            n += 1
+        used.add(rel.lower())
+        return rel
+
+    def same_content(key: tuple[str, str], rel: str, meta_hash: str) -> tuple[str, sqlite3.Row | None]:
+        """Action for content already planned under this key: copy if new or missing, else move / meta / skip."""
+        prev = exported.get(key)
+        if not prev:
+            return "copy", None
+        claimed.add(key)
+        if not (Path(root) / prev["rel_path"]).is_file():
+            return "copy", prev
+        if prev["rel_path"] != rel:
+            return "move", prev
+        return ("skip" if prev["meta_hash"] == meta_hash else "meta"), prev
 
     for a in assets:
         stem, ext = os.path.splitext(a["filename"])
@@ -191,31 +223,25 @@ def plan(conn: sqlite3.Connection, root: str) -> Plan:
             rel_dir = f"{a['user']}/{start[:4]}/{folder}"
         else:
             name, rel_dir = safe_name(stem, 80), f"{a['user']}/{NO_DATE_DIR}"
-        rel = f"{rel_dir}/{name}{ext}"
-        n = 2
-        while rel.lower() in used:
-            rel = f"{rel_dir}/{name}_{n}{ext}"
-            n += 1
-        used.add(rel.lower())
-
+        rel = unique(rel_dir, name, ext)
         args = metadata_args(a, tags[a["id"]], a["ev_name"])
         meta_hash = _meta_hash(rel, args)
         key = (a["user"], a["sha256"])
-        prev = exported.get(key)
-        if prev:
-            claimed.add(key)
-            if not (Path(root) / prev["rel_path"]).is_file():
-                action = "copy"
-            elif prev["rel_path"] != rel:
-                action = "move"
-            else:
-                action = "skip" if prev["meta_hash"] == meta_hash else "meta"
+        if key in exported:
+            action, prev = same_content(key, rel, meta_hash)
         else:
             older = next((exported[(a["user"], s)] for s in members[a["id"]] if (a["user"], s) in exported), None)
             if older:
                 claimed.add((a["user"], older["sha256"]))
             action, prev = ("replace", older) if older else ("copy", None)
         result.items.append(Planned(a, rel, args, meta_hash, action, prev))
+
+        if a["id"] in retouched:
+            v = retouched[a["id"]][0]
+            v_rel = unique(rel.rsplit("/", 1)[0], f"{os.path.splitext(rel.rsplit('/', 1)[1])[0]}{RETOUCHED_SUFFIX}", ".jpg")
+            v_hash = _meta_hash(v_rel, args)
+            v_action, v_prev = same_content((a["user"], v["sha256"]), v_rel, v_hash)
+            result.items.append(Planned(a, v_rel, args, v_hash, v_action, v_prev, version=v))
 
     result.orphans = [r for k, r in exported.items() if k not in claimed]
     return result
@@ -296,7 +322,7 @@ def _record(conn: sqlite3.Connection, root: str, p: Planned) -> None:
         conn.execute("DELETE FROM exported WHERE root = ? AND user = ? AND sha256 = ?", (root, a["user"], p.prev["sha256"]))
     conn.execute(
         "INSERT OR REPLACE INTO exported (root, user, sha256, rel_path, meta_hash, size) VALUES (?, ?, ?, ?, ?, ?)",
-        (root, a["user"], a["sha256"], p.rel_path, p.meta_hash, a["size"]),
+        (root, a["user"], p.sha, p.rel_path, p.meta_hash, p.size),
     )
 
 
@@ -311,7 +337,8 @@ def write_indexes(conn: sqlite3.Connection, root: str) -> None:
         sources[asset_id].append(f"{typ}-{ident}: {member}")
     rows = conn.execute(
         "SELECT x.rel_path, x.sha256, a.* , e.name AS ev_name FROM exported x "
-        "JOIN items i ON i.sha256 = x.sha256 JOIN assets a ON a.winner_id = i.id AND a.user = x.user "
+        "JOIN items i ON i.sha256 = coalesce((SELECT base_sha FROM versions WHERE sha256 = x.sha256), x.sha256) "
+        "JOIN asset_items ai ON ai.item_id = i.id JOIN assets a ON a.id = ai.asset_id AND a.user = x.user "
         "LEFT JOIN event_assets ea ON ea.asset_id = a.id LEFT JOIN events e ON e.id = ea.event_id "
         "WHERE x.root = ? GROUP BY x.rel_path ORDER BY x.rel_path", (root,)
     ).fetchall()
@@ -370,7 +397,8 @@ def run(
             try:
                 if x.action in ("copy", "replace"):
                     tmp = dest.with_name(f"{dest.stem}.photoorg-tmp{dest.suffix}")
-                    _copy_verified(library, items[x.asset["winner_id"]], tmp)
+                    source = versions.item_row(library.work, x.version) if x.version else items[x.asset["winner_id"]]
+                    _copy_verified(library, source, tmp)
                     target = _write_metadata(et, tmp, x.args)
                     if x.action == "replace" and x.prev is not None:
                         # the older copy often has the same name: move it out before the new one takes its place

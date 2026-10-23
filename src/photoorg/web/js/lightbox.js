@@ -1,10 +1,11 @@
 // Full-screen viewer. The photo grows out of its tile and returns to it; browsing is 1:1 with the
 // pointer, flicks are projected, every motion is an interruptible spring. Neighbours are preloaded.
 
-import { api, fileUrl, fullUrl, thumbUrl } from './api.js';
+import { api, fileUrl, fullUrl, thumbUrl, versionUrl } from './api.js';
 import {
   DATE_SOURCE, REASON, bytes, dayTitle, esc, icon, megapixels, num, plural, sourceLabel, timeOf, tzLabel,
 } from './format.js';
+import { RetouchEditor, stepLabel } from './retouch.js';
 import { animate, prefersReducedMotion, project, rubberband, velocityOf } from './spring.js';
 
 const PAD = 28;
@@ -38,10 +39,14 @@ export class Lightbox {
       <div class="lb-stage">
         <img class="lb-media" alt="" draggable="false">
         <video class="lb-media lb-video" controls playsinline hidden></video>
+        <canvas class="lb-brush" hidden></canvas>
       </div>
+      <div class="lb-brush-cursor" hidden></div>
       <header class="lb-bar">
         <div class="lb-title"><b></b><span></span></div>
         <div class="lb-actions">
+          <button class="lb-btn lb-pill" type="button" data-act="compare" aria-pressed="false" hidden title="Mostra l’originale (O)">Originale</button>
+          <button class="lb-btn" type="button" data-act="retouch" title="Ritocca (R)" aria-label="Ritocca">${icon('i-wand')}</button>
           <button class="lb-btn fav" type="button" data-act="fav" aria-pressed="false" title="Preferita (F)" aria-label="Preferita">${icon('i-star')}</button>
           <button class="lb-btn" type="button" data-act="exclude" title="Escludi dall’archivio (Canc)" aria-label="Escludi dall’archivio">${icon('i-trash')}</button>
           <a class="lb-btn" data-act="original" target="_blank" rel="noopener" title="Apri l’originale" aria-label="Apri l’originale">${icon('i-download')}</a>
@@ -52,7 +57,8 @@ export class Lightbox {
       <button class="lb-btn lb-nav prev" type="button" data-act="prev" aria-label="Precedente">${icon('i-left')}</button>
       <button class="lb-btn lb-nav next" type="button" data-act="next" aria-label="Successiva">${icon('i-right')}</button>
       <div class="lb-count"></div>
-      <aside class="lb-info" aria-label="Informazioni" hidden></aside>`;
+      <aside class="lb-info" aria-label="Informazioni" hidden></aside>
+      <aside class="lb-edit lb-info" aria-label="Ritocco" hidden></aside>`;
     document.body.append(el);
 
     this.el = el;
@@ -71,18 +77,24 @@ export class Lightbox {
     this.favBtn = el.querySelector('[data-act="fav"]');
     this.excludeBtn = el.querySelector('[data-act="exclude"]');
     this.originalLink = el.querySelector('[data-act="original"]');
+    this.compareBtn = el.querySelector('[data-act="compare"]');
+    this.retouchBtn = el.querySelector('[data-act="retouch"]');
+    this.showOriginal = false; // a retouched photo: show the original instead of the version
     this.onChange = null; // set by the app: (change) => void
-    this.info = el.querySelector('.lb-info');
+    this.info = el.querySelector('.lb-info:not(.lb-edit)');
     this.cache = new Map();
     this.assetCache = new Map();
     this.state = { x: 0, y: 0, s: 1, o: 0 };
     this.infoOpen = false;
     this.infoX = INFO_W;
     this.info.style.transform = `translateX(${INFO_W}px)`;
+    this.editor = new RetouchEditor(this);
 
     el.addEventListener('click', (e) => {
       const act = e.target.closest('[data-act]')?.dataset.act;
       if (act === 'close') this.close();
+      else if (act === 'retouch') this.editor.open();
+      else if (act === 'compare') this.toggleOriginal();
       else if (act === 'prev') this.step(-1);
       else if (act === 'next') this.step(1);
       else if (act === 'info') this.toggleInfo();
@@ -104,7 +116,7 @@ export class Lightbox {
 
   // ---------- geometry & rendering ----------
 
-  stageWidth() { return innerWidth - (this.infoOpen && !COMPACT() ? INFO_W : 0); }
+  stageWidth() { return innerWidth - ((this.infoOpen || this.editor.active) && !COMPACT() ? INFO_W : 0); }
 
   fit(e) {
     const ew = e.w || 1600;
@@ -121,6 +133,7 @@ export class Lightbox {
     this.rect = rect;
     this.media.style.width = `${rect.w}px`;
     this.media.style.height = `${rect.h}px`;
+    this.editor?.layout();
   }
 
   apply() {
@@ -149,8 +162,14 @@ export class Lightbox {
 
   // ---------- loading ----------
 
+  /** What the viewer shows of an entry: its retouched version, unless the original was asked for. */
+  shown(e, size) {
+    if (e.version && !(this.showOriginal && e === this.entry)) return versionUrl(e.version.id, size, e.version.v);
+    return size === 'full' ? fullUrl(e.item, e.v) : thumbUrl(e.item, e.v);
+  }
+
   fetchFull(e) {
-    const url = fullUrl(e.item, e.v);
+    const url = this.shown(e, 'full');
     let entry = this.cache.get(url);
     if (!entry) {
       const im = new Image();
@@ -180,10 +199,18 @@ export class Lightbox {
       this.video.removeAttribute('src');
       this.media = this.img;
       const full = this.fetchFull(e);
-      this.img.src = full.ready ? fullUrl(e.item, e.v) : thumbUrl(e.item, e.v);
+      this.img.src = full.ready ? this.shown(e, 'full') : this.shown(e, 'thumb');
       if (!full.ready) full.promise.then((url) => { if (this.entry === e) this.img.src = url; });
     }
-    this.originalLink.href = fileUrl(e.item);
+    this.originalLink.href = e.version && !this.showOriginal ? versionUrl(e.version.id, 'file', e.version.v) : fileUrl(e.item);
+  }
+
+  toggleOriginal() {
+    const e = this.entry;
+    if (!e?.version || this.editor.active) return;
+    this.showOriginal = !this.showOriginal;
+    this.load(e);
+    this.updateChrome();
   }
 
   preload() {
@@ -203,6 +230,10 @@ export class Lightbox {
     const editable = Boolean(e.asset);
     this.favBtn.hidden = !editable;
     this.excludeBtn.hidden = !editable;
+    this.retouchBtn.hidden = !editable || e.kind !== 'image' || this.editor.active;
+    this.compareBtn.hidden = !e.version || this.editor.active;
+    this.compareBtn.setAttribute('aria-pressed', String(this.showOriginal));
+    this.compareBtn.title = this.showOriginal ? 'Mostra la versione ritoccata (O)' : 'Mostra l’originale (O)';
     this.favBtn.setAttribute('aria-pressed', String(Boolean(e.fav)));
     const restore = Boolean(e.excluded);
     this.excludeBtn.innerHTML = icon(restore ? 'i-restore' : 'i-trash');
@@ -225,6 +256,7 @@ export class Lightbox {
     this.origin = origin;
     this.removeWhen = removeWhen;
     this.editingDate = false;
+    this.showOriginal = false;
     this.returnFocus = document.activeElement;
     this.el.hidden = false;
     document.body.classList.add('lb-open');
@@ -247,6 +279,7 @@ export class Lightbox {
 
   show(index, { from = 0, velocity = 0 } = {}) {
     this.index = index;
+    this.showOriginal = false;
     const e = this.entry;
     this.load(e);
     const rect = this.fit(e);
@@ -277,6 +310,7 @@ export class Lightbox {
 
   async close({ velocity } = {}) {
     if (this.closing || this.el.hidden) return;
+    if (this.editor.active) { this.editor.requestCancel(); return; }
     this.closing = true;
     this.video.pause();
     const e = this.entry;
@@ -353,7 +387,9 @@ export class Lightbox {
       this.onSearch?.(t.dataset.search);
       return;
     }
-    if (t.dataset.tagRemove) {
+    if (t.dataset.versionDelete) {
+      await this.dropVersion(e, Number(t.dataset.versionDelete));
+    } else if (t.dataset.tagRemove) {
       await this.changeTags(t.dataset.kind, [], [t.dataset.tagRemove]);
     } else if ('dateEdit' in t.dataset) {
       this.editingDate = true;
@@ -377,6 +413,38 @@ export class Lightbox {
       this.onChange?.({ entry: e, rebuilt: true }); // the automatic date needs a rebuild: ids change
       this.close();
     }
+  }
+
+  /** Back to the original: the version is hidden (undo puts it back). */
+  async dropVersion(e, id) {
+    const keep = { version: e.version, w: e.w, h: e.h };
+    try {
+      await api.post(`/api/versions/${id}/delete`, { deleted: true });
+    } catch (err) {
+      this.onChange?.({ error: err.message });
+      return;
+    }
+    const a = await api.get(`/api/asset/${e.asset}`).catch(() => null);
+    const w = a?.items.find((i) => i.role === 'winner');
+    Object.assign(e, { version: null, ...(w?.w ? { w: w.w, h: w.h } : {}) });
+    this.assetCache.delete(e.asset);
+    const redraw = () => {
+      if (this.entry !== e || this.el.hidden) return;
+      this.showOriginal = false;
+      this.load(e);
+      this.refit(false);
+      if (this.infoOpen) this.renderInfo();
+    };
+    redraw();
+    this.onChange?.({
+      entry: e, version: null,
+      undo: async () => {
+        await api.post(`/api/versions/${id}/delete`, { deleted: false });
+        Object.assign(e, keep);
+        this.assetCache.delete(e.asset);
+        redraw();
+      },
+    });
   }
 
   async onInfoKey(ev) {
@@ -453,7 +521,7 @@ export class Lightbox {
   // ---------- pointer: swipe to browse, drag down to close, pan when zoomed ----------
 
   onDown(ev) {
-    if (ev.button !== 0) return;
+    if (ev.button !== 0 || this.editor.active) return; // retouching: the photo stays put, the brush draws on its canvas
     if (this.media === this.video && ev.target === this.video) return; // leave video controls alone
     this.anim?.stop();
     this.drag = {
@@ -522,7 +590,9 @@ export class Lightbox {
   }
 
   onKey(e) {
-    if (this.el.hidden || e.altKey || e.ctrlKey || e.metaKey) return;
+    if (this.el.hidden) return;
+    if (this.editor.active && e.key !== 'Tab') { this.editor.onKey(e); return; }
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
     const keys = {
       Escape: () => (this.zoomed ? this.toggleZoom() : this.close()),
       ArrowLeft: () => this.step(-1),
@@ -534,6 +604,10 @@ export class Lightbox {
       f: () => this.toggleFavorite(),
       F: () => this.toggleFavorite(),
       Delete: () => this.toggleExclude(),
+      r: () => this.editor.open(),
+      R: () => this.editor.open(),
+      o: () => this.toggleOriginal(),
+      O: () => this.toggleOriginal(),
     };
     if (e.key === 'Tab') {
       const f = [...this.el.querySelectorAll('button:not([disabled]), a[href], video[controls]:not([hidden])')]
@@ -628,6 +702,14 @@ function dateSection(a, editing) {
     ${a.date_source === 'manual' ? '<button type="button" class="link-btn" data-date-reset>Torna alla data automatica</button>' : ''}</div></section>`;
 }
 
+function retouchSection(v) {
+  const steps = v.steps.map(stepLabel);
+  return `<section><h3>Ritocco</h3>
+    <p>${esc(steps.join(' · '))}.</p>
+    <p class="sub">${v.w ? `${num(v.w)} × ${num(v.h)} pixel. ` : ''}L’originale è conservato e resta il riferimento dell’archivio.</p>
+    <div class="row"><button type="button" class="link-btn" data-version-delete="${v.id}">Torna all’originale</button></div></section>`;
+}
+
 export function copyRow(m) {
   const kept = m.role === 'winner';
   const dims = m.w ? `${num(m.w)} × ${num(m.h)}, ` : '';
@@ -651,6 +733,7 @@ export function assetInfo(a, { editingDate = false } = {}) {
     ${tagSection('keyword', a.keywords ?? [])}
     ${a.auto_tags?.length ? `<section><h3>Riconosciuto automaticamente</h3><div class="chips">${a.auto_tags.map((t) =>
       `<button type="button" class="chip auto chip-link" data-search="${esc(t)}" title="Cerca le foto con ${esc(t)}">${esc(t)}</button>`).join('')}</div></section>` : ''}
+    ${a.versions?.length ? retouchSection(a.versions[0]) : ''}
     ${a.event?.name ? `<section><h3>Evento</h3><p>${esc(a.event.name)}</p></section>` : ''}
     ${a.description ? `<section><h3>Descrizione</h3><p>${esc(a.description)}</p></section>` : ''}
     <section><h3>Scatto</h3>

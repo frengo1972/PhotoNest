@@ -679,3 +679,76 @@ kbd {
   border: 1px solid var(--line); border-bottom-width: 2px; background: var(--bg); color: var(--text);
   font: 600 0.75rem/1.6 var(--font); text-align: center;
 }
+
+/* ---------- retouching (inside the viewer) ---------- */
+
+.tile .badge.retouched { left: 6px; bottom: 6px; padding: 0 5px; }
+.lb-pill { width: auto; padding: 0 14px; font: 600 0.8125rem/1 var(--font); }
+.lb.editing .lb-nav, .lb.editing .lb-count { display: none; }
+.lb-edit h2 { margin: 0; }
+.lb-edit .sub { margin-top: 6px; line-height: 1.4; }
+.lb-edit .tools { display: grid; gap: 8px; margin: 20px 0 8px; }
+.lb-edit .tool-wrap { border-radius: 14px; background: rgba(255, 255, 255, 0.06); transition: background 160ms ease-out; }
+.lb-edit .tool-wrap.open { background: rgba(156, 188, 243, 0.14); }
+.lb-edit .tool {
+  display: grid; grid-template-columns: 24px 1fr auto; gap: 12px; align-items: start; width: 100%;
+  padding: 12px 14px; border: 0; border-radius: 14px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer;
+  transition: background 120ms ease-out, transform 80ms ease-out;
+}
+.lb-edit button.tool:hover:not(:disabled) { background: rgba(255, 255, 255, 0.06); }
+.lb-edit button.tool:active:not(:disabled) { transform: scale(0.985); }
+.lb-edit .tool:disabled { cursor: default; opacity: 0.5; }
+.lb-edit .tool.static { cursor: default; }
+.lb-edit .tool > .icon { width: 24px; height: 24px; margin-top: 1px; color: #9cbcf3; }
+.lb-edit .tool b { display: block; font-weight: 600; }
+.lb-edit .tool small { display: block; margin-top: 2px; color: rgba(236, 235, 232, 0.62); font-size: 0.8125rem; line-height: 1.35; }
+.lb-edit .tool small.dl { display: flex; align-items: center; gap: 4px; margin-top: 6px; color: #c9dafb; }
+.lb-edit .tool small.dl .icon { width: 13px; height: 13px; }
+.lb-edit .tool small.dims { margin-top: 6px; font-variant-numeric: tabular-nums; }
+.lb-edit .strength {
+  display: grid; grid-template-columns: 64px 1fr; gap: 10px; align-items: center;
+  padding: 0 14px 12px 50px; color: rgba(236, 235, 232, 0.66); font-size: 0.8125rem;
+}
+.lb-edit input[type="range"] { width: 100%; margin: 0; accent-color: #9cbcf3; }
+.lb-edit .brush-box { padding: 0 14px 14px 50px; }
+.lb-edit .brush-box .strength { padding: 0 0 8px; }
+.lb-edit .hint { margin: 0 0 4px; color: rgba(236, 235, 232, 0.62); font-size: 0.8125rem; line-height: 1.35; }
+.lb-edit .segs { display: flex; gap: 4px; align-self: center; }
+.lb-edit .seg {
+  min-width: 44px; height: 32px; border: 0; border-radius: 9px; background: rgba(255, 255, 255, 0.12); color: #fff;
+  font: 600 0.875rem/1 var(--font); cursor: pointer; transition: background 120ms ease-out, transform 80ms ease-out;
+}
+.lb-edit .seg:hover:not(:disabled) { background: rgba(255, 255, 255, 0.22); }
+.lb-edit .seg:active:not(:disabled) { transform: scale(0.95); }
+.lb-edit .seg:disabled { opacity: 0.35; cursor: default; }
+.lb-edit .progress { margin: 12px 0; padding: 12px 14px; border-radius: 12px; background: rgba(156, 188, 243, 0.12); }
+.lb-edit .progress p { margin: 0 0 8px; font-size: 0.875rem; }
+.lb-edit .bar { height: 4px; border-radius: 2px; background: rgba(255, 255, 255, 0.12); overflow: hidden; }
+.lb-edit .bar i { display: block; height: 100%; border-radius: 2px; background: #9cbcf3; transition: width 200ms var(--ease-out); }
+.lb-edit .bar.indeterminate i { animation: lb-indeterminate 1.2s ease-in-out infinite; }
+@keyframes lb-indeterminate { from { transform: translateX(-100%); } to { transform: translateX(260%); } }
+@media (prefers-reduced-motion: reduce) { .lb-edit .bar.indeterminate i { animation: none; width: 100% !important; opacity: 0.5; } }
+.lb-edit .edit-error { margin: 12px 0; padding: 10px 14px; border-radius: 12px; background: rgba(242, 184, 181, 0.12); color: #f6cfcc; }
+.lb-edit .steps ol { margin: 0; padding-left: 20px; }
+.lb-edit .steps li { padding: 2px 0; }
+.lb-edit .link-btn { display: inline-flex; align-items: center; gap: 4px; }
+.lb-edit .link-btn .icon { width: 15px; height: 15px; }
+.lb-edit .link-btn[aria-pressed="true"] { color: #fff; }
+.lb-edit .link-btn:disabled, .lb-edit .dark-btn:disabled { opacity: 0.4; cursor: default; text-decoration: none; }
+.lb-edit .dark-btn { height: 36px; padding: 0 16px; border-radius: 10px; }
+.lb-edit .dark-btn.danger { background: #f2b8b5; color: #3b0d0a; }
+.lb-edit .edit-foot { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin-top: 8px; padding-top: 16px; border-top: 1px solid rgba(255, 255, 255, 0.08); }
+.lb-edit .edit-foot.confirm p { width: 100%; margin: 0; }
+.lb-brush { position: absolute; z-index: 1; opacity: 0.5; cursor: none; touch-action: none; }
+.lb-brush-cursor {
+  position: fixed; left: 0; top: 0; z-index: 6; border-radius: 50%; pointer-events: none;
+  border: 1.5px solid #fff; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45), inset 0 0 0 1px rgba(0, 0, 0, 0.3);
+}
+.lb.comparing .lb-stage::after {
+  content: "Prima"; position: absolute; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 2;
+  padding: 5px 14px; border-radius: 14px; background: rgba(0, 0, 0, 0.62); color: #fff; font-size: 0.8125rem; font-weight: 600;
+}
+.lb-btn[hidden] { display: none; }
+.lb-edit .row { gap: 16px; }
+body.lb-open .toast { z-index: 110; left: 50%; } /* feedback from the viewer shows above it */
+@media (min-width: 821px) { .lb.editing.comparing .lb-stage::after { left: calc(50% - 180px); } }

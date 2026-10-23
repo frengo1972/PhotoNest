@@ -13,6 +13,7 @@ from pathlib import Path
 
 HF = "https://huggingface.co"
 ZOO = "https://github.com/opencv/opencv_zoo/raw/main/models"
+FACEFUSION = f"{HF}/facefusion/models-3.0.0/resolve/main"  # ONNX exports of the retouching models
 
 MODELS: dict[str, str] = {
     # faces (OpenCV zoo)
@@ -26,10 +27,21 @@ MODELS: dict[str, str] = {
     "mclip/model.onnx": f"{HF}/sentence-transformers/clip-ViT-B-32-multilingual-v1/resolve/main/onnx/model_quint8_avx2.onnx",
     "mclip/tokenizer.json": f"{HF}/sentence-transformers/clip-ViT-B-32-multilingual-v1/resolve/main/tokenizer.json",
     "mclip/dense.safetensors": f"{HF}/sentence-transformers/clip-ViT-B-32-multilingual-v1/resolve/main/2_Dense/model.safetensors",
+    # retouching
+    "retouch/gfpgan_1.4.onnx": f"{FACEFUSION}/gfpgan_1.4.onnx",
+    "retouch/lama.onnx": f"{ZOO}/inpainting_lama/inpainting_lama_2025jan.onnx",
+    "retouch/real_esrgan_x2_fp16.onnx": f"{FACEFUSION}/real_esrgan_x2_fp16.onnx",
+    "retouch/real_esrgan_x4_fp16.onnx": f"{FACEFUSION}/real_esrgan_x4_fp16.onnx",
 }
 FACE_MODELS = ("yunet.onnx", "sface.onnx")
 CLIP_MODELS = ("clip/vision_fp16.onnx", "clip/text_fp16.onnx", "clip/tokenizer.json")
 SEARCH_MODELS = ("mclip/model.onnx", "mclip/tokenizer.json", "mclip/dense.safetensors")
+RETOUCH_MODELS = {  # per tool, with the download size shown before the first use
+    "faces": (("yunet.onnx", "retouch/gfpgan_1.4.onnx"), 340),
+    "inpaint": (("retouch/lama.onnx",), 93),
+    "upscale2": (("retouch/real_esrgan_x2_fp16.onnx",), 36),
+    "upscale4": (("retouch/real_esrgan_x4_fp16.onnx",), 36),
+}
 
 
 def models_dir() -> Path:

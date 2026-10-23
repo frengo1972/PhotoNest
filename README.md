@@ -45,6 +45,8 @@ Chiusa la finestra, il server locale si spegne da solo dopo qualche minuto.
 |---|---|
 | Galleria | clic sul cerchio di una foto (o Ctrl+clic, Maiusc+clic per un intervallo, Ctrl+A tutte) → barra in basso: *Preferite*, *Album*, *Persone*, *Etichette*, *Data*, *Escludi* |
 | Visualizzatore | ← → o trascina per sfogliare, trascina in basso o Esc per chiudere, clic per zoom 1:1; `F` preferita, `Canc` escludi, `I` informazioni: lì si correggono data, album, persone, etichette |
+| Ritocco (`R` nel visualizzatore) | *Colori ed esposizione*, *Ripristina i volti* (GFPGAN), *Rimuovi macchie e graffi* col pennello (LaMa), *Ingrandisci* ×2/×4 (Real-ESRGAN), tutto sul PC; intensità regolabile, *Annulla l'ultimo*, Spazio tenuto premuto per confrontare con prima; *Salva come nuova versione* |
+| Foto ritoccata | la galleria mostra la versione (icona bacchetta); `O` nel visualizzatore mostra l'originale; in *Informazioni* → *Torna all'originale*; sul NAS va accanto all'originale come `…_ritoccata.jpg` |
 | Ovunque | dopo un'esclusione compare *Annulla* |
 
 Le modifiche sono salvate per contenuto (sha256): restano valide dopo ogni aggiornamento, anche se arriva una copia migliore della stessa foto.
@@ -70,7 +72,8 @@ uv run pytest               # test
 ```
 
 `scan` è incrementale: rilanciato, rielabora solo file nuovi o cambiati. Il catalogo è in `work/catalog.db`
-(SQLite, apribile con DB Browser for SQLite); cancellando `work/` si riparte da zero senza perdere nulla.
+(SQLite, apribile con DB Browser for SQLite). Le versioni ritoccate sono in `work/versions` (gli originali non
+vengono mai modificati); i modelli AI si scaricano al primo uso in `%LOCALAPPDATA%\photoorg\models`.
 
 | Comando | Fase | Cosa fa |
 |---|---|---|

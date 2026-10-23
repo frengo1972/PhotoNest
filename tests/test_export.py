@@ -109,6 +109,38 @@ def test_export_incremental(setup):
     assert len(rows) == 2 and {r["evento"] for r in rows} == {"Borgo"}
 
 
+def test_export_retouched_version(setup):
+    client, nas = setup
+    client.post("/api/nas", json={"root": str(nas), "create": True})
+    items = client.get("/api/timeline", params={"user": "utente"}).json()["items"]
+    c = next(i for i in items if i["d"].startswith("2021"))
+    client.post(f"/api/retouch/{c['a']}/open")
+    client.post(f"/api/retouch/{c['a']}/apply", json={"tool": "color"})
+    for _ in range(200):
+        if not client.get("/api/retouch").json()["busy"]:
+            break
+        time.sleep(0.05)
+    version = client.post(f"/api/retouch/{c['a']}/save").json()["version"]
+
+    client.post("/api/export")
+    _wait(client)
+    files = _files(nas)
+    folder = "utente/2021/2021-05-01"
+    assert f"{folder}/2021-05-01_120000_IMG_C.jpg" in files
+    assert f"{folder}/2021-05-01_120000_IMG_C_ritoccata.jpg" in files
+    assert _read_tags(nas / f"{folder}/2021-05-01_120000_IMG_C_ritoccata.jpg")[-1] == "2021:05:01 12:00:00"
+    plan = client.get("/api/nas").json()["plan"]
+    assert (plan["copy"], plan["skip"]) == (0, 4)
+
+    # back to the original: the retouched copy goes to _esclusi, the original stays
+    client.post(f"/api/versions/{version['id']}/delete", json={"deleted": True})
+    client.post("/api/export")
+    _wait(client)
+    files = _files(nas)
+    assert "utente/_esclusi/2021/2021-05-01/2021-05-01_120000_IMG_C_ritoccata.jpg" in files
+    assert f"{folder}/2021-05-01_120000_IMG_C.jpg" in files
+
+
 def test_safe_name():
     assert safe_name('a:b/c*?"<>|. ') == "a_b_c______"
     assert safe_name("   ") == "senza-nome"

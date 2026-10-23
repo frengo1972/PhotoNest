@@ -22,7 +22,7 @@ import urllib.request
 import webbrowser
 from collections import deque
 from collections.abc import Callable
-from contextlib import closing
+from contextlib import closing, suppress
 from datetime import datetime
 from pathlib import Path
 
@@ -32,10 +32,10 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from photoorg import catalog, dedup, edits, events, export
+from photoorg import catalog, dedup, edits, events, export, versions
 from photoorg.exiftool import find as find_exiftool
 from photoorg.ingest import ingest
-from photoorg.library import Library
+from photoorg.library import Library, save_video_size
 from photoorg.normalize import normalize
 from photoorg.report import REVIEW_FLAGS
 from photoorg.sources import discover_sources
@@ -201,6 +201,24 @@ MEMBER_SELECT = (  # copies of an asset, with their role in the duplicate group
     f"SELECT {ITEM_COLUMNS}, ai.role, ai.reason, ai.distance FROM asset_items ai "
     "JOIN items i ON i.id = ai.item_id JOIN sources s ON s.id = i.source_id"
 )
+GRID_COLUMNS = (
+    "a.id a, a.kind, a.date_local, a.n_items, a.variant_group, a.favorite, i.id, i.sha256, i.width, i.height, i.orientation"
+)
+
+
+def _latest_versions(conn: sqlite3.Connection) -> dict[int, sqlite3.Row]:
+    """Newest retouched version of each asset that has one (few: loaded at once, not joined per row)."""
+    return {asset_id: rows[0] for asset_id, rows in versions.for_assets(conn).items()}
+
+
+def _grid_item(r: sqlite3.Row, album: str | None, version: sqlite3.Row | None) -> dict:
+    """An asset in the gallery; a retouched photo shows its newest version (r = version id)."""
+    w, h = (version["width"], version["height"]) if version else _dims(r)
+    return {"a": r["a"], "i": r["id"], "v": _v(r), "k": r["kind"], "w": w, "h": h, "d": r["date_local"],
+            "n": r["n_items"], "g": r["variant_group"], "al": album, "f": r["favorite"],
+            "r": version["id"] if version else None, "rv": version["sha256"][:12] if version else None}
+
+
 WINNER_SELECT = (  # winning item of each asset, with the asset id
     f"SELECT {ITEM_COLUMNS}, a.id AS asset_id FROM assets a "
     "JOIN items i ON i.id = a.winner_id JOIN sources s ON s.id = i.source_id"
@@ -224,6 +242,16 @@ class TagEdit(BaseModel):
 
 class AssetIds(BaseModel):
     ids: list[int]
+
+
+class RetouchApply(BaseModel):
+    tool: str
+    params: dict = {}
+    replace_last: bool = False  # adjusting the strength of the last step: redo it instead of adding one
+
+
+class VersionDelete(BaseModel):
+    deleted: bool = True
 
 
 class VariantKeep(BaseModel):
@@ -262,6 +290,7 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
             dedup.build(conn, log=lambda _: None)
     library = Library(work)
     job = Job()
+    retouch = versions.RetouchSession(work, library)
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.state.last_seen = time.monotonic()
     app.state.job = job
@@ -344,18 +373,13 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
         """Assets of the archive, newest first; excluded=true lists the trash instead."""
         with db() as conn:
             rows = conn.execute(
-                "SELECT a.id a, a.kind, a.date_local, a.n_items, a.variant_group, a.favorite, i.id, i.sha256, "
-                "i.width, i.height, i.orientation, "
+                f"SELECT {GRID_COLUMNS}, "
                 "(SELECT album FROM asset_albums WHERE asset_id = a.id ORDER BY album LIMIT 1) album "
                 "FROM assets a JOIN items i ON i.id = a.winner_id WHERE a.user = ? AND a.excluded = ? "
                 "ORDER BY a.date_local IS NULL, a.date_local DESC, a.id DESC", (user, int(excluded))
             ).fetchall()
-        out = []
-        for r in rows:
-            w, h = _dims(r)
-            out.append({"a": r["a"], "i": r["id"], "v": _v(r), "k": r["kind"], "w": w, "h": h, "d": r["date_local"],
-                        "n": r["n_items"], "g": r["variant_group"], "al": r["album"], "f": r["favorite"]})
-        return {"items": out}
+            latest = _latest_versions(conn)
+        return {"items": [_grid_item(r, r["album"], latest.get(r["a"])) for r in rows]}
 
     @app.get("/api/names")
     def names(user: str) -> dict:
@@ -423,10 +447,12 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
                 conn.execute("SELECT count(*) FROM assets WHERE variant_group = ?", (a["variant_group"],)).fetchone()[0]
                 if a["variant_group"] else 0
             )
+            retouched = versions.for_assets(conn, [asset_id]).get(asset_id, [])
         return {
             **{k: a[k] for k in a.keys()}, "flags": a["flags"].split(",") if a["flags"] else [],
             "albums": albums, "people": people, "keywords": keywords, "variants": variants, "items": items,
             "auto_tags": auto, "event": dict(event) if event else None,
+            "versions": [versions.describe(v) for v in retouched],
         }
 
     @app.post("/api/assets/details")
@@ -738,15 +764,62 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
             rank = {a: n for n, a in enumerate(ids)}
             marks = ",".join("?" * len(ids))
             rows = conn.execute(
-                f"SELECT a.id a, a.kind, a.date_local, a.n_items, a.variant_group, a.favorite, i.id, i.sha256, "
-                f"i.width, i.height, i.orientation FROM assets a JOIN items i ON i.id = a.winner_id WHERE a.id IN ({marks})",
+                f"SELECT {GRID_COLUMNS} FROM assets a JOIN items i ON i.id = a.winner_id WHERE a.id IN ({marks})",
                 ids).fetchall()
-        out = []
-        for r in sorted(rows, key=lambda r: rank[r["a"]]):
-            w, h = _dims(r)
-            out.append({"a": r["a"], "i": r["id"], "v": _v(r), "k": r["kind"], "w": w, "h": h, "d": r["date_local"],
-                        "n": r["n_items"], "g": r["variant_group"], "al": None, "f": r["favorite"]})
-        return {"items": out}
+            latest = _latest_versions(conn)
+        return {"items": [_grid_item(r, None, latest.get(r["a"])) for r in sorted(rows, key=lambda r: rank[r["a"]])]}
+
+    # ---------- retouching ----------
+
+    def retouching(fn: Callable[[], dict]) -> dict:
+        try:
+            return fn()
+        except LookupError as ex:
+            raise HTTPException(404, str(ex)) from ex
+        except RuntimeError as ex:
+            raise HTTPException(409, str(ex)) from ex
+        except ValueError as ex:
+            raise HTTPException(400, str(ex)) from ex
+
+    @app.get("/api/retouch")
+    def retouch_state() -> dict:
+        return retouch.state()
+
+    @app.post("/api/retouch/{asset_id}/open")
+    def retouch_open(asset_id: int) -> dict:
+        with db() as conn:
+            return retouching(lambda: retouch.open(conn, asset_id))
+
+    @app.post("/api/retouch/{asset_id}/apply")
+    def retouch_apply(asset_id: int, body: RetouchApply) -> dict:
+        return retouching(lambda: retouch.apply(asset_id, body.tool, body.params, body.replace_last))
+
+    @app.post("/api/retouch/{asset_id}/undo")
+    def retouch_undo(asset_id: int) -> dict:
+        return retouching(lambda: retouch.undo(asset_id))
+
+    @app.post("/api/retouch/{asset_id}/save")
+    def retouch_save(asset_id: int) -> dict:
+        with db() as conn:
+            version_id = retouching(lambda: retouch.save(conn, asset_id))
+            row = conn.execute("SELECT * FROM versions WHERE id = ?", (version_id,)).fetchone()
+        return {"version": versions.describe(row)}
+
+    @app.post("/api/retouch/prepare/{tool}")
+    def retouch_prepare(tool: str) -> dict:
+        retouch.prepare(tool)
+        return {"ok": True}
+
+    @app.post("/api/retouch/close")
+    def retouch_close() -> dict:
+        retouch.close()
+        return {"ok": True}
+
+    @app.post("/api/versions/{version_id}/delete")
+    def version_delete(version_id: int, body: VersionDelete) -> dict:
+        with db() as conn:
+            retouching(lambda: versions.set_deleted(conn, version_id, body.deleted))
+        return {"ok": True}
 
     # ---------- events ----------
 
@@ -794,6 +867,13 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
 
     def _preview(item_id: int, size: str) -> Response:
         r = _row(item_id)
+        if r["kind"] == "video" and size == "thumb" and r["sha256"] and not library.has_thumb(r):
+            video_size = library.render_video(r)
+            if not video_size:  # may become readable later (zip back in place): the placeholder is not kept
+                return Response(_placeholder(r["kind"]), media_type="image/svg+xml", headers={"Cache-Control": "no-cache"})
+            with suppress(sqlite3.OperationalError), db() as conn:  # a busy catalog: the next scan fills it in
+                save_video_size(conn, r["sha256"], video_size)
+                conn.commit()
         path = library.preview(r, size)
         if path is None:
             return Response(_placeholder(r["kind"]), media_type="image/svg+xml", headers=CACHE_FOREVER)
@@ -806,6 +886,34 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
     @app.get("/media/full/{item_id}")
     def full(item_id: int) -> Response:
         return _preview(item_id, "full")
+
+    @app.get("/media/retouch/{asset_id}")
+    def retouch_preview(asset_id: int) -> Response:
+        try:
+            data = retouch.preview(asset_id)
+        except LookupError as ex:
+            raise HTTPException(404, str(ex)) from ex
+        return Response(data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    def _version(version_id: int) -> dict:
+        with db() as conn:
+            v = conn.execute("SELECT * FROM versions WHERE id = ?", (version_id,)).fetchone()
+        if v is None:
+            raise HTTPException(404, "versione non trovata")
+        return versions.item_row(work, v)
+
+    @app.get("/media/version/{version_id}/{size}")
+    def version_media(version_id: int, size: str) -> Response:
+        row = _version(version_id)
+        if size == "file":
+            return FileResponse(library.original(row), media_type="image/jpeg", filename=row["filename"],
+                                content_disposition_type="inline")
+        if size not in ("thumb", "full"):
+            raise HTTPException(404, "formato sconosciuto")
+        path = library.preview(row, size)
+        if path is None:
+            raise HTTPException(404, "versione non leggibile")
+        return FileResponse(path, media_type="image/jpeg", headers=CACHE_FOREVER)
 
     @app.get("/media/file/{item_id}")
     def original(item_id: int) -> Response:

@@ -205,6 +205,20 @@ CREATE TABLE IF NOT EXISTS faces (
 );
 CREATE INDEX IF NOT EXISTS faces_sha ON faces(sha256);
 
+-- Retouched versions (JPEG files in work/versions), keyed by the copy of the photo they were made from.
+CREATE TABLE IF NOT EXISTS versions (
+    id          INTEGER PRIMARY KEY,
+    base_sha    TEXT NOT NULL,      -- sha256 of the copy the retouch started from
+    sha256      TEXT NOT NULL UNIQUE,
+    steps       TEXT NOT NULL,      -- JSON: the tools applied, in order
+    width       INTEGER NOT NULL,
+    height      INTEGER NOT NULL,
+    size        INTEGER NOT NULL,
+    deleted     INTEGER NOT NULL DEFAULT 0,     -- hidden by the user (the file stays)
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS versions_base ON versions(base_sha);
+
 CREATE TABLE IF NOT EXISTS settings (
     key     TEXT PRIMARY KEY,
     value   TEXT NOT NULL

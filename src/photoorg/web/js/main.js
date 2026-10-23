@@ -127,6 +127,7 @@ async function loadGallery({ keep = false } = {}) {
   if (!ctx.user) { gallery.entries = []; gallery.empty(emptyArchive()); return; }
   const toEntries = (items) => items.map((it) => ({
     item: it.i, v: it.v, w: it.w, h: it.h, kind: it.k, date: it.d, asset: it.a, fav: Boolean(it.f), excluded: false, caption: it.al,
+    version: it.r ? { id: it.r, v: it.rv } : null,
   }));
   if (galleryQuery) {
     const { items } = await api.get(`/api/search?${q({ user: ctx.user, q: galleryQuery })}`);
@@ -164,6 +165,17 @@ lightbox.onChange = (change) => {
   galleryStale = true;
   if (change.tags) loadNames();
   if (change.rebuilt) { refresh().then(route); return; }
+  if (change.version) toast('Ritocco salvato come nuova versione: l’originale resta intatto');
+  if (change.version === null) {
+    toast('Torna a mostrare l’originale', {
+      action: 'Annulla',
+      onAction: async () => {
+        await change.undo();
+        galleryStale = true;
+        if (lightbox.el.hidden && ctx.current === 'galleria') reloadGallery();
+      },
+    });
+  }
   if (change.exclude !== undefined) {
     refresh();
     const { entry } = change;
