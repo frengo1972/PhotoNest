@@ -113,6 +113,8 @@ def ingest(
                     log(f"  {processed + unchanged}/{len(media)}")
 
             stale = [known[k][0] for k in known.keys() - seen]
+            # Assets are derived data (rebuilt by dedup) and their winner_id blocks deleting the item.
+            conn.executemany("DELETE FROM assets WHERE winner_id = ?", [(i,) for i in stale])
             conn.executemany("DELETE FROM items WHERE id = ?", [(i,) for i in stale])
             conn.commit()
 

@@ -81,6 +81,18 @@ def test_scan_and_browse(client):
     assert client.get("/static/js/main.js").status_code == 200
 
 
+def test_rescan_after_files_removed(client, tmp_path):
+    assert _scan(client)["error"] is None
+    phone = tmp_path / "income" / "utente" / "android-test"
+    (phone / "IMG_2.jpg").unlink()  # the only copy: its asset goes too
+    (phone / "IMG_1.jpg").unlink()  # one of two copies: the asset stays with the other
+
+    job = _scan(client)
+    assert job["error"] is None, job["lines"]
+    state = client.get("/api/state").json()
+    assert state["counts"]["assets"] == 2 and state["counts"]["copies"] == 2
+
+
 def _timeline(client, **params):
     return client.get("/api/timeline", params={"user": "utente", **params}).json()["items"]
 
