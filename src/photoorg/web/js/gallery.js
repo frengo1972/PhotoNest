@@ -1,6 +1,10 @@
 // Timeline: one section per day, as a grid of justified rows that keep every photo's proportions or as
 // a details list (preview on the left, everything known about the photo on the right).
-// Tiles are created only for days near the viewport, so thousands of photos stay light.
+//
+// Built for 100k photos. The timeline arrives in light form (asset id and proportions of every photo,
+// grouped by day): enough to lay out the whole archive exactly, so the scroll bar and the years jump
+// anywhere at once. Only the days near the screen exist in the page, and what their tiles show is
+// loaded a page at a time as they come into view; days far away are dropped again.
 //
 // Selection, as in Explorer / Lightroom: the circle on a tile, Ctrl+click toggles one photo, Shift+click
 // extends from the last one, dragging draws a rectangle (Shift adds to the selection, Ctrl inverts inside
@@ -25,8 +29,13 @@ const VIEW_KEY = 'photoorg.view';
 const VIEWS = ['grid', 'list'];
 const DRAG_START = 6; // px of movement before a press becomes a selection rectangle
 const EDGE = 56; // band at the top / bottom of the screen that scrolls while dragging
+const AHEAD = 1600; // px above and below the screen whose days are built (and their tiles loaded)
+const KEEP = 4800; // days further than this from the screen are dropped from the page
+const PAGE = 200; // tiles whose details are loaded together
 
 const ratioOf = (it) => (it.w && it.h ? Math.min(MAX_RATIO, Math.max(MIN_RATIO, it.w / it.h)) : 1.5);
+const loaded = (it) => it.i !== undefined;
+const shownHtml = new WeakMap(); // tile -> what it shows, to leave it alone when that did not change
 
 function loadPref(key, valid, fallback) {
   try {
@@ -71,6 +80,8 @@ export class Gallery {
     this.results = null; // title of the search results section, null for the timeline
     this.items = [];
     this.days = [];
+    this.dayAlbums = new Map();
+    this.live = new Set(); // days whose section is in the page
     this.lines = [];
     this.tiles = new Map();
     this.selected = new Set();
@@ -111,6 +122,11 @@ export class Gallery {
     this.total = this.head.querySelector('.total');
     this.body = root.querySelector('.gallery-body');
     this.years = root.querySelector('.years');
+    // an empty day, never shown, to measure where rows start and how wide they are
+    this.probe = document.createElement('section');
+    this.probe.className = 'day probe';
+    this.probe.setAttribute('aria-hidden', 'true');
+    this.probe.innerHTML = '<header class="day-head"><h2>Ag</h2><span>Ag</span></header><div class="rows"></div>';
     this.zoomButtons = [...this.head.querySelectorAll('[data-zoom]')];
     this.viewButtons = [...this.head.querySelectorAll('[data-view]')];
     this.modeButton = this.head.querySelector('.select-mode');
@@ -127,11 +143,11 @@ export class Gallery {
     this.searchInput.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !this.searchInput.value) this.searchInput.blur(); });
     this.clearButton.addEventListener('click', () => { this.searchInput.value = ''; this.onSearch?.(''); });
 
-    this.io = new IntersectionObserver((entries) => {
-      for (const e of entries) if (e.isIntersecting) this.materialize(this.dayOf.get(e.target));
-    }, { root: scroller, rootMargin: '1600px 0px' });
-    new ResizeObserver(() => this.schedule('layout')).observe(this.body);
-    scroller.addEventListener('scroll', () => this.schedule('head'), { passive: true });
+    new ResizeObserver(([entry]) => {
+      // the body's height is set by the layout itself: only a new width needs a new layout
+      if (entry.contentRect.width !== this.bodyWidth) { this.bodyWidth = entry.contentRect.width; this.schedule('layout'); }
+    }).observe(this.body);
+    scroller.addEventListener('scroll', () => this.schedule('scroll'), { passive: true });
     scroller.addEventListener('wheel', (e) => {
       if (!e.ctrlKey || this.root.hidden || this.root.closest('[hidden]')) return;
       e.preventDefault();
@@ -165,6 +181,27 @@ export class Gallery {
   // ---------- data ----------
 
   /**
+   * The timeline in light form (/api/timeline/index): {days: [[day, n, albums]], a, w, h, k} newest first.
+   * keep: same archive reloaded after an edit: what was loaded is shown at once and refreshed.
+   */
+  setIndex({ days, a, w, h, k }, { keep = false, ...opts } = {}) {
+    const before = keep ? new Map(this.items.filter(loaded).map((it) => [it.a, it])) : null;
+    const items = new Array(a.length);
+    this.dayAlbums = new Map();
+    let n = 0;
+    for (const [day, count, albums] of days) {
+      if (albums.length) this.dayAlbums.set(day, albums);
+      for (let j = 0; j < count; j++, n++) {
+        const old = before?.get(a[n]);
+        items[n] = old
+          ? { ...old, w: w[n], h: h[n], day, stale: true, loading: null }
+          : { a: a[n], w: w[n], h: h[n], k: k[n] ? 'video' : 'image', day };
+      }
+    }
+    this.setData(items, { keep, ...opts });
+  }
+
+  /**
    * items: timeline rows. With `results` (a title) they are shown as one section, in the given order.
    * keep: same list reloaded after an edit, so selection and cursor follow their photos.
    */
@@ -178,51 +215,34 @@ export class Gallery {
     this.searchInput.value = query;
     this.clearButton.hidden = results === null;
     this.tiles.clear();
+    this.live.clear();
     this.details.clear();
     this.selected = new Set();
     this.cursor = null;
     this.anchor = null;
     this.base = null;
-    this.io.disconnect();
-    this.dayOf = new Map();
     this.days = [];
     let cur = null;
     items.forEach((it, idx) => {
-      const key = results !== null ? 'results' : it.d ? it.d.slice(0, 10) : 'none';
+      const key = results !== null ? 'results' : it.day ?? 'none';
       if (!cur || cur.key !== key) {
-        cur = { key, date: it.d, start: idx, end: idx, albums: new Set(), nsel: 0 };
+        cur = { key, n: this.days.length, date: results !== null ? null : it.day ?? null, start: idx, end: idx, nsel: 0 };
         this.days.push(cur);
       }
       cur.end = idx;
-      if (it.al) cur.albums.add(it.al);
     });
-
-    const frag = document.createDocumentFragment();
     for (const day of this.days) {
-      const sec = document.createElement('section');
-      sec.className = 'day';
-      const albums = [...day.albums].slice(0, 2).join(', ');
-      const title = results !== null ? results : dayTitle(day.date);
-      const n = day.end - day.start + 1;
-      sec.innerHTML = `<header class="day-head">
-          <button type="button" class="day-check" aria-pressed="false" title="Seleziona ${n === 1 ? 'la foto' : `le ${num(n)} foto`} del giorno" aria-label="Seleziona tutto: ${esc(title)}">${icon('i-check')}</button>
-          <h2>${esc(title)}</h2>${albums && results === null ? `<span>${esc(albums)}</span>` : ''}
-        </header><div class="rows"></div>`;
-      day.el = sec;
-      day.check = sec.querySelector('.day-check');
-      day.rowsEl = sec.lastElementChild;
+      day.title = results !== null ? results : dayTitle(day.date);
       day.label = dayTitle(day.date, true);
-      this.dayOf.set(sec, day);
-      frag.append(sec);
+      day.albums = results !== null ? [] : this.dayAlbums.get(day.key) ?? [];
     }
-    this.body.replaceChildren(frag);
+    this.body.replaceChildren(this.probe);
 
-    const videos = items.filter((it) => it.k === 'video').length;
+    const videos = items.reduce((n, it) => n + (it.k === 'video'), 0);
     const photos = items.length - videos;
     this.total.textContent = videos ? `${num(photos)} foto, ${num(videos)} video` : `${num(photos)} foto`;
     this.years.innerHTML = results !== null ? '' : this.yearButtons();
     this.layout();
-    for (const day of this.days) this.io.observe(day.el);
     this.updateHead();
 
     if (keptSel?.size) this.applySelection(new Set(items.flatMap((it, i) => (keptSel.has(it.a) ? [i] : []))), false);
@@ -235,10 +255,55 @@ export class Gallery {
     this.updateMode();
   }
 
+  /** Photos that left the list (put in the trash): dropped here, without reloading the archive. */
+  remove(assets) {
+    const gone = new Set(assets);
+    if (!this.items.some((it) => gone.has(it.a))) return;
+    this.setData(this.items.filter((it) => !gone.has(it.a)), { results: this.results, query: this.searchInput.value, keep: true });
+  }
+
+  /** Change fields of some photos (e.g. f: favourite) and redraw their tiles. */
+  patch(assets, fields) {
+    const ids = new Set(assets);
+    const changed = new Set(this.items.filter((it) => ids.has(it.a)));
+    for (const it of changed) Object.assign(it, fields);
+    this.refreshTiles(changed);
+  }
+
+  /**
+   * Load what the tiles of these photos show (those not loaded yet, or stale after a reload), then redraw
+   * their tiles. Resolves when all of them are loaded; used by the viewer too.
+   */
+  fetchDetails(list) {
+    const want = list.filter((it) => (!loaded(it) || it.stale) && !it.loading && !it.gone);
+    const waiting = list.flatMap((it) => (it.loading ? [it.loading] : []));
+    if (want.length) {
+      const job = api.post('/api/timeline/items', { ids: want.map((it) => it.a) }).then(({ items }) => {
+        const byId = new Map(items.map((x) => [x.a, x]));
+        for (const it of want) {
+          const x = byId.get(it.a);
+          if (x) { Object.assign(it, x); it.stale = false; } else it.gone = !loaded(it); // removed meanwhile
+        }
+        this.refreshTiles(new Set(want));
+      }).finally(() => { for (const it of want) it.loading = null; });
+      for (const it of want) it.loading = job;
+      waiting.push(job);
+    }
+    return Promise.all(waiting);
+  }
+
+  /** Details for the pages of the timeline holding items start..end. */
+  loadRange(start, end) {
+    const from = Math.max(0, Math.floor(start / PAGE) * PAGE);
+    const to = Math.min(this.items.length, (Math.floor(end / PAGE) + 1) * PAGE);
+    this.fetchDetails(this.items.slice(from, to)).catch(() => {}); // tiles stay blank; retried when built again
+  }
+
   empty(html, opts = {}) {
     this.setData([], opts);
     this.title.textContent = opts.results !== undefined && opts.results !== null ? 'Ricerca' : 'Galleria';
     this.total.textContent = '';
+    this.body.style.height = '';
     this.body.innerHTML = html;
   }
 
@@ -261,6 +326,7 @@ export class Gallery {
     this.raf = requestAnimationFrame(() => {
       this.raf = 0;
       if (this.pending.has('layout')) this.layout();
+      else this.updateWindow();
       this.updateHead();
       this.pending.clear();
     });
@@ -270,17 +336,20 @@ export class Gallery {
     return Math.min(ZOOM_HEIGHTS[this.zoom], Math.max(90, width / 2.2));
   }
 
-  /** Recompute rows for the current width, zoom and view; call after the view becomes visible. */
+  /** Recompute rows and day positions for the current width, zoom and view; call after the view becomes visible. */
   layout() {
-    const first = this.days[0];
-    const width = first?.rowsEl.clientWidth ?? 0;
-    if (!width) { this.dirty = true; return; }
+    const rowsProbe = this.probe.lastElementChild;
+    const width = this.probe.isConnected ? rowsProbe.clientWidth : 0;
+    if (!width) { this.dirty = this.days.length > 0; return; }
     this.dirty = false;
-    // where the rows of a day start, inside its section and inside the scroller (same for every day)
+    // where the rows of a day start inside its section, and where the body starts inside the scroller
     const sr = this.scroller.getBoundingClientRect();
-    const rr = first.rowsEl.getBoundingClientRect();
-    this.rowsOff = rr.top - first.el.getBoundingClientRect().top;
+    const pr = this.probe.getBoundingClientRect();
+    const rr = rowsProbe.getBoundingClientRect();
+    this.rowsOff = rr.top - pr.top;
+    this.body.style.setProperty('--day-head-h', `${this.rowsOff}px`); // every day header exactly as tall
     this.rowsLeft = rr.left - sr.left + this.scroller.scrollLeft;
+    this.bodyTop = pr.top - sr.top + this.scroller.scrollTop;
 
     const list = this.view === 'list';
     const gap = list ? LIST_GAP : GAP;
@@ -288,6 +357,7 @@ export class Gallery {
     if (list) this.body.style.setProperty('--preview-w', `${Math.round(Math.min(target * 1.5, width * 0.42))}px`);
     this.lines = []; // rows of tiles across all days, for Up / Down and Page Up / Down
     this.lineOf = new Int32Array(this.items.length);
+    let top = 0;
     for (const day of this.days) {
       const pos = [];
       let y = 0;
@@ -318,18 +388,15 @@ export class Gallery {
       }
       day.pos = pos;
       day.height = Math.max(0, y - gap);
-      day.rowsEl.style.height = `${day.height}px`;
-      day.el.style.containIntrinsicSize = `auto ${day.height + this.rowsOff}px`;
-      if (day.materialized) this.place(day);
+      day.y = top; // inside the body
+      day.top = this.bodyTop + top; // inside the scroller's content
+      top += this.rowsOff + day.height;
+      if (day.el) this.placeDay(day);
     }
-    this.measureTops();
+    this.body.style.height = `${top}px`;
+    this.updateWindow();
   }
 
-  measureTops() {
-    for (const day of this.days) day.top = day.el.offsetTop;
-  }
-
-  /** Change the layout while keeping what is on screen in place: `change` runs between measure and restore. */
   keepPlace(change) {
     const headH = this.head.offsetHeight;
     const cursorShown = this.cursor !== null && this.isOnScreen(this.cursor);
@@ -338,6 +405,7 @@ export class Gallery {
     change();
     if (cursorShown) this.ensureVisible(this.cursor, true);
     else if (anchorDay) this.scroller.scrollTop = anchorDay.top + within * (anchorDay.height + this.rowsOff) - headH;
+    this.updateWindow();
     this.updateHead();
   }
 
@@ -361,11 +429,8 @@ export class Gallery {
       this.updateViewButtons();
       this.root.classList.toggle('view-list', view === 'list');
       // tiles are built differently in the two views: start again from empty days
-      this.io.disconnect();
-      this.tiles.clear();
-      for (const day of this.days) { day.materialized = false; day.rowsEl.replaceChildren(); }
+      for (const day of [...this.live]) this.unmaterialize(day);
       this.layout();
-      for (const day of this.days) this.io.observe(day.el);
     });
     if (this.cursor !== null) this.setCursor(this.cursor, { focus: hadFocus, scroll: false });
   }
@@ -380,45 +445,97 @@ export class Gallery {
   }
 
   shown() {
-    if (this.dirty) this.layout();
+    if (this.dirty) this.layout(); else this.updateWindow();
     this.updateHead();
   }
 
+  /** Build the days near the screen and drop those far away: the page holds a few hundred tiles, not 100k. */
+  updateWindow() {
+    if (!this.days.length || this.dirty || this.root.closest('[hidden]')) return;
+    const top = this.scroller.scrollTop;
+    const bottom = top + this.scroller.clientHeight;
+    const keep = this.cursor !== null ? this.dayOfItem(this.cursor) : null; // the cursor tile may have the focus
+    for (const day of [...this.live]) {
+      if (day !== keep && (day.top + this.rowsOff + day.height < top - KEEP || day.top > bottom + KEEP)) this.unmaterialize(day);
+    }
+    for (let n = this.dayIndexAt(top - AHEAD); n < this.days.length && this.days[n].top <= bottom + AHEAD; n++) {
+      this.materialize(this.days[n]);
+    }
+  }
+
   materialize(day) {
-    if (!day || day.materialized || !day.pos) return;
-    day.materialized = true;
+    if (!day || day.el || !day.pos) return;
     const list = this.view === 'list';
-    const focusable = this.cursor ?? 0;
+    const n = day.end - day.start + 1;
+    const sec = document.createElement('section');
+    sec.className = 'day';
+    sec.dataset.day = day.n;
+    const albums = day.albums.join(', ');
+    sec.innerHTML = `<header class="day-head">
+        <button type="button" class="day-check" aria-pressed="${day.nsel === n}" title="Seleziona ${n === 1 ? 'la foto' : `le ${num(n)} foto`} del giorno" aria-label="Seleziona tutto: ${esc(day.title)}">${icon('i-check')}</button>
+        <h2>${esc(day.title)}</h2>${albums ? `<span>${esc(albums)}</span>` : ''}
+      </header><div class="rows"></div>`;
+    day.el = sec;
+    day.check = sec.querySelector('.day-check');
+    day.rowsEl = sec.lastElementChild;
     const frag = document.createDocumentFragment();
     for (let idx = day.start; idx <= day.end; idx++) {
-      const it = this.items[idx];
       const b = document.createElement('button');
       b.type = 'button';
       b.className = list ? 'tile detail' : 'tile';
       b.dataset.idx = idx;
-      b.tabIndex = idx === focusable ? 0 : -1;
+      b.tabIndex = idx === (this.cursor ?? 0) ? 0 : -1;
       b.setAttribute('aria-pressed', String(this.selected.has(idx)));
-      b.setAttribute('aria-label', `${it.k === 'video' ? 'Video' : 'Foto'} di ${day.label}`);
-      const media = `<img alt="" decoding="async" loading="lazy" draggable="false" src="${it.r ? versionUrl(it.r, 'thumb', it.rv) : thumbUrl(it.i, it.v)}">`
-        + `<span class="sel" title="Seleziona">${icon('i-check')}</span>`
-        + (it.k === 'video' ? `<span class="badge video">${icon('i-play')}</span>` : '')
-        + (it.f ? `<span class="badge fav" title="Preferita">${icon('i-star')}</span>` : '')
-        + (it.r ? `<span class="badge retouched" title="Ritoccata">${icon('i-wand')}</span>` : '')
-        + (it.n > 1 ? `<span class="badge copies" title="Unita da ${it.n} copie">${icon('i-copies')}${it.n}</span>` : '');
-      b.innerHTML = list
-        ? `<span class="thumb" data-fit="contain">${media}</span><span class="meta">${this.metaHtml(idx)}</span>`
-        : media;
-      const img = b.querySelector('img');
-      img.addEventListener('load', () => img.classList.add('loaded'), { once: true });
+      this.fillTile(b, idx);
       this.tiles.set(idx, b);
       frag.append(b);
     }
     day.rowsEl.append(frag);
-    this.place(day);
+    this.placeDay(day);
+    this.body.append(sec);
+    this.live.add(day);
+    if (day.end >= day.start) this.loadRange(day.start, day.end);
     if (list) this.loadDetails(day);
   }
 
-  place(day) {
+  unmaterialize(day) {
+    if (!day.el) return;
+    day.el.remove();
+    for (let idx = day.start; idx <= day.end; idx++) this.tiles.delete(idx);
+    day.el = day.check = day.rowsEl = null;
+    this.live.delete(day);
+  }
+
+  /** What a tile shows: a blank placeholder until its details arrive. */
+  fillTile(b, idx) {
+    const it = this.items[idx];
+    const list = b.classList.contains('detail');
+    const ready = loaded(it);
+    const media = (ready ? `<img alt="" decoding="async" draggable="false" src="${it.r ? versionUrl(it.r, 'thumb', it.rv) : thumbUrl(it.i, it.v)}">` : '')
+      + `<span class="sel" title="Seleziona">${icon('i-check')}</span>`
+      + (it.k === 'video' ? `<span class="badge video">${icon('i-play')}</span>` : '')
+      + (it.f ? `<span class="badge fav" title="Preferita">${icon('i-star')}</span>` : '')
+      + (it.r ? `<span class="badge retouched" title="Ritoccata">${icon('i-wand')}</span>` : '')
+      + (it.n > 1 ? `<span class="badge copies" title="Unita da ${it.n} copie">${icon('i-copies')}${it.n}</span>` : '');
+    const html = list
+      ? `<span class="thumb" data-fit="contain">${media}</span><span class="meta">${this.metaHtml(idx)}</span>`
+      : media;
+    if (html === shownHtml.get(b)) return; // reloaded with the same content: keep the image as it is
+    shownHtml.set(b, html);
+    b.innerHTML = html;
+    b.setAttribute('aria-label', `${it.k === 'video' ? 'Video' : 'Foto'} di ${this.dayOfItem(idx).label}`);
+    const img = b.querySelector('img');
+    if (img?.complete) img.classList.add('loaded'); // already in the browser's cache: no fade
+    else img?.addEventListener('load', () => img.classList.add('loaded'), { once: true });
+  }
+
+  refreshTiles(items) {
+    for (const [idx, b] of this.tiles) if (items.has(this.items[idx])) this.fillTile(b, idx);
+  }
+
+  placeDay(day) {
+    day.el.style.top = `${day.y}px`;
+    day.rowsEl.style.height = `${day.height}px`;
     for (let k = 0; k < day.pos.length; k++) {
       const p = day.pos[k];
       const s = this.tiles.get(day.start + k).style;
@@ -486,14 +603,15 @@ export class Gallery {
     }
     if (this.view !== 'list') return;
     for (let idx = day.start; idx <= day.end; idx++) {
-      const meta = this.tiles.get(idx)?.querySelector('.meta');
-      if (meta) meta.innerHTML = this.metaHtml(idx);
+      const tile = this.tiles.get(idx);
+      if (tile) this.fillTile(tile, idx);
     }
   }
 
   metaHtml(idx) {
     const it = this.items[idx];
     const d = this.details.get(it.a);
+    const date = it.d ?? it.day;
     const time = it.d ? [timeOf(it.d), d?.tz !== null && d?.tz !== undefined ? tzLabel(d.tz) : ''].filter(Boolean).join(' · ') : '';
     const facts = [];
     const add = (label, value, cls = '') => {
@@ -516,10 +634,11 @@ export class Gallery {
       const conf = d.date_conf === 'medium' ? ', da confermare' : d.date_conf === 'low' ? ', poco affidabile' : '';
       add('Data', d.manual ? 'Impostata da te' : it.d ? esc(`Ricavata ${DATE_SOURCE[d.date_source] ?? ''}${conf}`) : '', conf ? 'attention' : '');
       add('Descrizione', esc(d.description ?? ''), 'wide');
+      add('Descrizione AI', esc(d.caption ?? ''), 'wide');
     } else {
       facts.push('<span class="fact loading"><small>Dettagli</small><span>…</span></span>');
     }
-    return `<span class="meta-head"><b>${esc(it.d ? dayTitle(it.d, true) : 'Senza data')}</b>`
+    return `<span class="meta-head"><b>${esc(date ? dayTitle(date, true) : 'Senza data')}</b>`
       + `${time ? `<span>${esc(time)}</span>` : ''}${it.k === 'video' ? '<span class="pill">Video</span>' : ''}`
       + `${it.f ? `<span class="star" title="Preferita">${icon('i-star')}</span>` : ''}</span>`
       + `<span class="facts-flow">${facts.join('')}</span>`;
@@ -533,10 +652,11 @@ export class Gallery {
     const prev = this.tiles.get(this.cursor ?? 0);
     if (prev) prev.tabIndex = -1;
     this.cursor = idx;
+    if (scroll) this.ensureVisible(idx);
     this.materialize(this.dayOfItem(idx));
     const tile = this.tiles.get(idx);
+    if (!tile) return; // hidden view: built when shown
     tile.tabIndex = 0;
-    if (scroll) this.ensureVisible(idx);
     if (focus) tile.focus({ preventScroll: true });
   }
 
@@ -557,6 +677,7 @@ export class Gallery {
     if (center) this.scroller.scrollTop += r.y + r.h / 2 - (top + bottom) / 2;
     else if (y < top || r.h > bottom - top) this.scroller.scrollTop -= top - y;
     else if (r.y + r.h > bottom) this.scroller.scrollTop += r.y + r.h - bottom;
+    this.updateWindow();
     this.updateHead();
   }
 
@@ -680,7 +801,7 @@ export class Gallery {
     if (this.suppressClick) return;
     const check = e.target.closest('.day-check');
     if (check) {
-      this.toggleDay(this.dayOf.get(check.closest('.day')));
+      this.toggleDay(this.days[Number(check.closest('.day').dataset.day)]);
       return;
     }
     const tile = e.target.closest('.tile');
@@ -725,7 +846,6 @@ export class Gallery {
     d.active = true;
     d.base = d.how === 'replace' ? new Set() : new Set(this.selected);
     this.body.setPointerCapture(d.id);
-    this.measureTops();
     d.box = document.createElement('div');
     d.box.className = 'marquee';
     this.root.append(d.box);
@@ -840,7 +960,7 @@ export class Gallery {
     for (const i of this.selected) if (!next.has(i)) mark(i, false);
     for (const i of next) if (!this.selected.has(i)) mark(i, true);
     this.selected = next;
-    for (const day of touched) day.check.setAttribute('aria-pressed', String(day.nsel === day.end - day.start + 1));
+    for (const day of touched) day.check?.setAttribute('aria-pressed', String(day.nsel === day.end - day.start + 1));
     if (notify) this.updateMode();
   }
 
@@ -881,8 +1001,9 @@ export class Gallery {
   /** Scroll to the first day on or before `date` ("YYYY-MM-DD ..."): the timeline runs newest first. */
   scrollToDate(date) {
     const key = date.slice(0, 10);
-    const day = this.days.find((d) => d.key <= key) ?? this.days.at(-1);
+    const day = this.days.find((d) => d.date && d.date <= key) ?? this.days.at(-1);
     if (day) this.scroller.scrollTop = day.top - this.head.offsetHeight;
+    this.updateWindow();
     this.updateHead();
   }
 
@@ -895,7 +1016,6 @@ export class Gallery {
   /** Make sure the tile of `idx` exists and is on screen, and put the cursor there (viewer closing). */
   reveal(idx) {
     if (idx === undefined || idx < 0 || idx >= this.items.length) return;
-    this.measureTops();
     this.ensureVisible(idx);
     this.setCursor(idx, { focus: false, scroll: false });
     this.anchor = idx;

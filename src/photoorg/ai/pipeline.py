@@ -43,8 +43,15 @@ def status(conn: sqlite3.Connection) -> dict:
         "SELECT count(DISTINCT i.sha256) FROM assets a JOIN items i ON i.id = a.winner_id "
         "WHERE a.excluded = 0 AND i.kind = 'image'"
     ).fetchone()[0]
+    done = conn.execute(  # starts from the analysed contents: far fewer than the photos until the analysis ran
+        "SELECT count(DISTINCT f.sha256) FROM ai_done f "
+        "JOIN ai_done c ON c.sha256 = f.sha256 AND c.task = 'clip' AND c.version >= ? "
+        "WHERE f.task = 'faces' AND f.version >= ? AND EXISTS (SELECT 1 FROM items i JOIN assets a ON a.winner_id = i.id "
+        "  WHERE i.sha256 = f.sha256 AND i.kind = 'image' AND a.excluded = 0)",
+        (CLIP_VERSION, FACE_VERSION),
+    ).fetchone()[0]
     return {
-        "total": total, "pending": len(pending(conn)),
+        "total": total, "pending": total - done,
         "models": not models.missing(models.FACE_MODELS + models.CLIP_MODELS),
         "faces": conn.execute("SELECT count(*) FROM faces WHERE rejected = 0").fetchone()[0],
         "tagged": conn.execute("SELECT count(DISTINCT sha256) FROM auto_tags").fetchone()[0],

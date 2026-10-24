@@ -66,9 +66,10 @@ def tags_for(prob: np.ndarray, labels: list[str]) -> dict[str, float]:
 
 
 def compute(conn: sqlite3.Connection, clip=None) -> int:
-    """Rewrite auto_tags for every stored embedding. Returns how many photos got at least one tag."""
+    """Rewrite the CLIP auto_tags for every stored embedding (the vision model's labels stay).
+    Returns how many photos got at least one tag."""
     rows = conn.execute("SELECT sha256, emb FROM clip_embeddings").fetchall()
-    conn.execute("DELETE FROM auto_tags")
+    conn.execute("DELETE FROM auto_tags WHERE source = 'clip'")
     if not rows:
         conn.commit()
         return 0
@@ -81,6 +82,8 @@ def compute(conn: sqlite3.Connection, clip=None) -> int:
     for (sha, _), p in zip(rows, prob):
         found = tags_for(p, labels)
         tagged += bool(found)
-        conn.executemany("INSERT INTO auto_tags VALUES (?, ?, ?)", [(sha, t, round(s, 3)) for t, s in found.items()])
+        conn.executemany(
+            "INSERT OR IGNORE INTO auto_tags (sha256, tag, score) VALUES (?, ?, ?)",
+            [(sha, t, round(s, 3)) for t, s in found.items()])
     conn.commit()
     return tagged

@@ -6,6 +6,7 @@ photos that look most like the words; "bambina con la torta" works through simil
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import threading
 
@@ -67,6 +68,18 @@ def matching_labels(q: str) -> list[str]:
     return out
 
 
+def caption_matches(conn: sqlite3.Connection, user: str, q: str) -> list[int]:
+    """Photos whose caption has every word of the query (plural/singular endings are ignored)."""
+    words = [w[:-1] if len(w) >= 5 else w for w in re.findall(r"\w+", q.lower()) if len(w) >= 4]
+    if not words:
+        return []
+    cond = " AND ".join("lower(c.text) LIKE ?" for _ in words)
+    return [r[0] for r in conn.execute(
+        "SELECT a.id FROM assets a JOIN items i ON i.id = a.winner_id JOIN captions c ON c.sha256 = i.sha256 "
+        f"WHERE a.user = ? AND a.excluded = 0 AND {cond} ORDER BY a.date_local DESC",
+        (user, *[f"%{w}%" for w in words]))]
+
+
 def exact(conn: sqlite3.Connection, user: str, q: str) -> list[int]:
     like = f"%{q.lower()}%"
     labels = matching_labels(q)
@@ -87,7 +100,7 @@ def exact(conn: sqlite3.Connection, user: str, q: str) -> list[int]:
         "          WHERE lower(t.tag) LIKE ?) OR lower(coalesce(a.description, '')) LIKE ?) "
         "ORDER BY a.date_local DESC", (user, like, like, like, like, like, like)
     ).fetchall()
-    found = list(dict.fromkeys(by_label + [r[0] for r in rows]))
+    found = list(dict.fromkeys(by_label + [r[0] for r in rows] + caption_matches(conn, user, q)))
     return found
 
 

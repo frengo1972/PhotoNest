@@ -5,8 +5,8 @@ import { esc, icon, num, plural } from './format.js';
 import { Gallery } from './gallery.js';
 import { Lightbox } from './lightbox.js';
 import {
-  renderDuplicates, renderEvents, renderIssues, renderJobPanel, renderNas, renderOverview, renderPeople, renderSources,
-  renderTrash, renderVariants,
+  renderCaptions, renderDuplicates, renderEvents, renderIssues, renderJobPanel, renderNas, renderOverview, renderPeople,
+  renderSources, renderTrash, renderVariants,
 } from './views.js';
 
 const $ = (s) => document.querySelector(s);
@@ -26,11 +26,12 @@ const ctx = {
   onLeave: (fn) => ctx.leaveHandlers.push(fn),
   refresh,
   toast,
+  undoable: (text, undo) => undoable(text, undo),
   markPending: () => { $('#pending').hidden = false; },
   galleryChanged: () => { galleryStale = true; },
   ask: (opts) => ask(opts),
   confirm: (title, text, confirmLabel) => ask({ title, text, confirm: confirmLabel }),
-  startJob: (url) => startJob(url),
+  startJob: (url, body) => startJob(url, body),
   gotoDate: (date) => {
     pendingDate = date;
     galleryQuery = '';
@@ -51,15 +52,37 @@ let galleryQuery = '';
 let galleryUser = null;
 let galleryStale = false;
 let galleryScroll = 0;
+// Favourites and exclusions made in the viewer opened on the gallery: applied to it without reloading the
+// archive, when the viewer closes (or at once, for an edit that completes after closing).
+const viewerEdits = { removed: new Set(), fav: new Map() };
+let galleryEntries = new WeakSet();
+
+/** Viewer entry for a gallery item; an item not loaded yet gets its details when the viewer reaches it. */
+const toEntry = (it) => ({
+  item: it.i, v: it.v, w: it.w, h: it.h, kind: it.k, date: it.d ?? it.day, asset: it.a, fav: Boolean(it.f), excluded: false,
+  caption: it.al, version: it.r ? { id: it.r, v: it.rv } : null,
+});
+const VIEWER_PAGE = 60; // photos on each side whose details are fetched with the one shown
 
 const gallery = new Gallery(galleryView, main, {
   onOpen: (idx) => {
-    const entries = gallery.entries;
+    const items = gallery.items;
+    const entries = items.map(toEntry);
     const indexOf = new Map(entries.map((e, i) => [e, i]));
+    galleryEntries = new WeakSet(entries);
     lightbox.open(entries, idx, {
       tile: (e) => gallery.tileFor(indexOf.get(e)),
       reveal: (e) => gallery.reveal(indexOf.get(e)),
-    }, { removeWhen: (e) => e.excluded });
+    }, {
+      removeWhen: (e) => e.excluded,
+      fill: async (e) => {
+        const at = indexOf.get(e);
+        const lo = Math.max(0, at - VIEWER_PAGE);
+        const hi = Math.min(items.length, at + VIEWER_PAGE + 1);
+        await gallery.fetchDetails(items.slice(lo, hi));
+        for (let j = lo; j < hi; j++) if (entries[j].item === undefined) Object.assign(entries[j], toEntry(items[j]));
+      },
+    });
   },
   onSelect: (items, { mode }) => renderSelectionBar(items, mode),
   bottomInset: () => ($('#selbar').hidden ? 0 : $('#selbar').offsetHeight + 22),
@@ -124,14 +147,9 @@ async function loadGallery({ keep = false } = {}) {
   galleryUser = ctx.user;
   galleryStale = false;
   lightbox.invalidate();
-  if (!ctx.user) { gallery.entries = []; gallery.empty(emptyArchive()); return; }
-  const toEntries = (items) => items.map((it) => ({
-    item: it.i, v: it.v, w: it.w, h: it.h, kind: it.k, date: it.d, asset: it.a, fav: Boolean(it.f), excluded: false, caption: it.al,
-    version: it.r ? { id: it.r, v: it.rv } : null,
-  }));
+  if (!ctx.user) { gallery.empty(emptyArchive()); return; }
   if (galleryQuery) {
     const { items } = await api.get(`/api/search?${q({ user: ctx.user, q: galleryQuery })}`);
-    gallery.entries = toEntries(items);
     if (items.length) {
       gallery.setData(items, { results: `${plural(items.length, 'risultato', 'risultati')} per «${galleryQuery}»`, query: galleryQuery, keep });
     } else {
@@ -141,9 +159,8 @@ async function loadGallery({ keep = false } = {}) {
     }
     return;
   }
-  const { items } = await api.get(`/api/timeline?${q({ user: ctx.user })}`);
-  gallery.entries = toEntries(items);
-  if (items.length) gallery.setData(items, { keep }); else gallery.empty(emptyArchive());
+  const index = await api.get(`/api/timeline/index?${q({ user: ctx.user })}`);
+  if (index.a.length) gallery.setIndex(index, { keep }); else gallery.empty(emptyArchive());
 }
 
 /** Reload after edits, keeping the scroll position, the selection and the cursor. */
@@ -154,41 +171,46 @@ async function reloadGallery() {
   if (visible) { gallery.shown(); main.scrollTop = scroll; } else galleryScroll = scroll;
 }
 
+function applyViewerEdits() {
+  for (const [asset, value] of viewerEdits.fav) gallery.patch([asset], { f: value ? 1 : 0 });
+  if (viewerEdits.removed.size) gallery.remove([...viewerEdits.removed]);
+  viewerEdits.fav.clear();
+  viewerEdits.removed.clear();
+}
+
 lightbox.onClose = () => {
   if (ctx.current !== 'galleria') return;
   gallery.focusCursor();
-  if (galleryStale) reloadGallery();
+  if (galleryStale) reloadGallery(); else applyViewerEdits();
 };
 lightbox.onSearch = (query) => ctx.searchFor(query);
+lightbox.onUndo = () => runUndo();
 lightbox.onChange = (change) => {
   if (change.error) { toast(change.error); return; }
-  galleryStale = true;
+  const fromGallery = Boolean(change.entry) && galleryEntries.has(change.entry);
+  if (fromGallery && change.favorite !== undefined) viewerEdits.fav.set(change.entry.asset, change.favorite);
+  else if (fromGallery && change.exclude !== undefined) viewerEdits.removed[change.exclude ? 'add' : 'delete'](change.entry.asset);
+  else galleryStale = true;
+  if (fromGallery && lightbox.el.hidden && !galleryStale) applyViewerEdits();
   if (change.tags) loadNames();
   if (change.rebuilt) { refresh().then(route); return; }
-  if (change.version) toast('Ritocco salvato come nuova versione: l’originale resta intatto');
-  if (change.version === null) {
-    toast('Torna a mostrare l’originale', {
-      action: 'Annulla',
-      onAction: async () => {
-        await change.undo();
-        galleryStale = true;
-        if (lightbox.el.hidden && ctx.current === 'galleria') reloadGallery();
-      },
+  if (change.version) {
+    const { entry, version, replaced, previous } = change;
+    undoable('Ritocco salvato come nuova versione: l’originale resta intatto', async () => {
+      await api.post(`/api/versions/${version.id}/delete`, { deleted: true });
+      if (replaced) await api.post(`/api/versions/${replaced}/delete`, { deleted: false });
+      lightbox.restore(entry, previous);
     });
   }
+  if (change.version === null) undoable('Tornata all’originale', change.undo);
   if (change.exclude !== undefined) {
     refresh();
     const { entry } = change;
-    toast(change.exclude ? 'Messa nel cestino' : 'Rimessa nell’archivio', {
-      action: 'Annulla',
-      onAction: async () => {
-        await api.post('/api/assets/edit', { ids: [entry.asset], exclude: !change.exclude });
-        entry.excluded = !change.exclude;
-        change.undo?.();
-        galleryStale = true;
-        refresh();
-        if (lightbox.el.hidden && ctx.current === 'galleria') reloadGallery();
-      },
+    undoable(change.exclude ? 'Messa nel cestino' : 'Rimessa nell’archivio', async () => {
+      await api.post('/api/assets/edit', { ids: [entry.asset], exclude: !change.exclude });
+      entry.excluded = !change.exclude;
+      change.undo?.();
+      viewerEdits.removed.delete(entry.asset);
     });
   }
 };
@@ -215,6 +237,7 @@ function renderSelectionBar(items, mode) {
     <button class="btn" type="button" data-sel="person">${icon('i-person')}Persone</button>
     <button class="btn" type="button" data-sel="keyword">${icon('i-tag')}Etichette</button>
     <button class="btn" type="button" data-sel="date">${icon('i-calendar')}Data</button>
+    <button class="btn" type="button" data-sel="describe" title="Scrivi la descrizione con l’AI">${icon('i-caption')}Descrivi</button>
     <span class="divider"></span>
     <button class="btn danger" type="button" data-sel="exclude" title="Metti nel cestino (Canc)">${icon('i-trash')}Escludi</button>
     <button class="btn btn-quiet" type="button" data-sel="all" title="Seleziona tutto (Ctrl+A)">Tutte</button>
@@ -245,7 +268,14 @@ async function runAction(action, items) {
     if (action === 'fav') {
       const value = !items.every((it) => it.f);
       await api.post('/api/assets/edit', { ids, favorite: value });
-      toast(value ? `${n} tra le preferite` : `${n} tolte dalle preferite`);
+      gallery.patch(ids, { f: value ? 1 : 0 });
+      const was = items.filter((it) => it.f).map((it) => it.a);
+      undoable(value ? `${n} tra le preferite` : `${n} tolte dalle preferite`, async () => {
+        const wasNot = ids.filter((id) => !was.includes(id));
+        if (was.length) await api.post('/api/assets/edit', { ids: was, favorite: true });
+        if (wasNot.length) await api.post('/api/assets/edit', { ids: wasNot, favorite: false });
+      });
+      return;
     } else if (TAG_DIALOG[action]) {
       const d = TAG_DIALOG[action];
       const value = await ask({ ...d, text: `Per ${n}.`, list: `names-${action}` });
@@ -262,12 +292,16 @@ async function runAction(action, items) {
       if (!value) return;
       await api.post('/api/assets/edit', { ids, date_local: value.replace('T', ' ').padEnd(19, ':00').slice(0, 19) });
       toast(`Data impostata su ${n}`);
+    } else if (action === 'describe') {
+      // one photo: describe it again even if it has a caption; several: only the ones that have none
+      await startJob('/api/ai/describe', { ids, redo: ids.length === 1 });
+      return;
     } else if (action === 'exclude') {
       await api.post('/api/assets/edit', { ids, exclude: true });
-      toast(`${n} nel cestino`, {
-        action: 'Annulla',
-        onAction: async () => { await api.post('/api/assets/edit', { ids, exclude: false }); await refresh(); reloadGallery(); },
-      });
+      gallery.remove(ids); // at once, without reloading the archive
+      undoable(`${n} nel cestino`, () => api.post('/api/assets/edit', { ids, exclude: false }));
+      refresh(); // sidebar counts
+      return;
     }
     await refresh();
     await reloadGallery();
@@ -326,6 +360,7 @@ const SCREENS = {
   fonti: renderSources,
   nas: renderNas,
   persone: renderPeople,
+  didascalie: renderCaptions,
 };
 
 async function route() {
@@ -377,6 +412,35 @@ function toast(text, { action, onAction } = {}) {
   toastTimer = setTimeout(() => { t.hidden = true; }, action ? 7000 : 4000);
 }
 
+// ---------- undo ----------
+
+const UNDO_LIMIT = 30;
+const undoStack = [];
+
+/** Tell what was done and keep a way back: the toast offers Annulla, Ctrl+Z takes the latest actions back one by one. */
+function undoable(text, undo) {
+  const item = { text, undo };
+  undoStack.push(item);
+  if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+  toast(text, { action: 'Annulla', onAction: () => runUndo(item) });
+}
+
+async function runUndo(item = undoStack[undoStack.length - 1]) {
+  if (!item) { toast('Non c’è niente da annullare'); return; }
+  undoStack.splice(undoStack.indexOf(item), 1);
+  try {
+    await item.undo();
+    await refresh();
+  } catch (err) {
+    toast(err.message);
+    return;
+  }
+  galleryStale = true;
+  lightbox.invalidate();
+  if (lightbox.el.hidden) await (ctx.current === 'galleria' ? reloadGallery() : route());
+  toast(`Annullato: ${item.text.charAt(0).toLowerCase()}${item.text.slice(1)}`);
+}
+
 // ---------- scan ----------
 
 let polling = false;
@@ -385,6 +449,7 @@ const JOB_DONE = {
   scan: ['Archivio aggiornato', 'Aggiornamento non riuscito: i dettagli sono in Fonti'],
   export: ['Archivio sul NAS aggiornato', 'Copia sul NAS non riuscita: i dettagli sono in Archivio NAS'],
   ai: ['Analisi completata: volti ed etichette pronti', 'Analisi non riuscita: i dettagli sono in Persone'],
+  caption: ['Descrizioni pronte', 'Descrizioni non riuscite: i dettagli sono in Didascalie'],
 };
 
 async function pollJob() {
@@ -396,7 +461,7 @@ async function pollJob() {
       job = await api.get('/api/job');
       ctx.state.job = job;
       renderJobMini(job);
-      if (['fonti', 'nas', 'persone'].includes(ctx.current)) renderJobPanel($('.jobpanel-slot'), job);
+      if (['fonti', 'nas', 'persone', 'didascalie'].includes(ctx.current)) renderJobPanel($('.jobpanel-slot'), job);
       if (!job.running) break;
       await sleep(700);
     }
@@ -412,12 +477,12 @@ async function pollJob() {
 }
 
 /** Start a background operation (scan or export) and follow its progress. */
-async function startJob(url) {
-  jobKind = url.includes('export') ? 'export' : url.includes('/ai/') ? 'ai' : 'scan';
+async function startJob(url, body) {
+  jobKind = url.includes('export') ? 'export' : url.includes('/describe') ? 'caption' : url.includes('/ai/') ? 'ai' : 'scan';
   try {
-    ctx.state.job = await api.post(url);
+    ctx.state.job = await api.post(url, body);
     renderJobMini(ctx.state.job);
-    if (['fonti', 'panoramica', 'nas', 'persone'].includes(ctx.current)) await route();
+    if (['fonti', 'panoramica', 'nas', 'persone', 'didascalie'].includes(ctx.current)) await route();
     pollJob();
   } catch (err) {
     toast(err.message);
@@ -433,11 +498,16 @@ document.addEventListener('click', (e) => {
   if (action === 'scan') startScan();
   if (action === 'open-income') api.post('/api/open-income').catch((err) => toast(err.message));
   if (action === 'keys') showKeys();
+  if (e.target.closest('[data-job-cancel]')) {
+    e.target.closest('button').disabled = true;
+    api.post('/api/job/cancel').catch((err) => toast(err.message));
+  }
 });
 $('#scan-btn').addEventListener('click', startScan);
 
 document.addEventListener('keydown', (e) => {
   if (!lightbox.el.hidden || $('#sheet').open || $('#keys').open || e.target.closest('input, textarea, select')) return;
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'z') { e.preventDefault(); runUndo(); return; }
   if (ctx.current !== 'galleria') return;
   const plain = !e.ctrlKey && !e.metaKey && !e.altKey;
   if (plain && e.key === '?') { e.preventDefault(); showKeys(); return; }

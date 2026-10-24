@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from photoorg.ai import models
+from photoorg import versions
 from photoorg.ai.retouch import Retoucher, _regions, auto_color, upscale_options
 from photoorg.server import create_app
 
@@ -68,6 +69,27 @@ def test_models_shapes():
     fixed = engine.inpaint(big, mask)
     assert fixed.shape == big.shape and fixed[190, 300].mean() > 120  # filled from the surroundings
     assert np.array_equal(fixed[:100], big[:100])                     # far from the stain: untouched
+
+
+def test_geometry_helpers():
+    img = np.zeros((200, 300, 3), np.uint8)
+    img[:, :150] = 255   # left half white
+    right = versions.turn(img, 1)
+    assert right.shape == (300, 200, 3) and right[:150].min() == 255 and right[150:].max() == 0  # left half is on top
+    assert np.array_equal(versions.turn(versions.turn(img, 1), 3), img)
+    assert np.array_equal(versions.turn(img, -1), versions.turn(img, 3))
+
+    level = versions.straighten(np.full((200, 300, 3), 90, np.uint8), 7.5)
+    assert level.shape[1] / level.shape[0] == pytest.approx(1.5, abs=0.02) and level.shape[0] < 200
+    assert abs(int(level.mean()) - 90) <= 1   # flat colour in, flat colour out: no empty corner
+    wide = versions.straighten(np.zeros((200, 300, 3), np.uint8), -45)
+    assert wide.shape[0] >= 1 and wide.shape[1] >= 1
+
+    assert versions.crop_box(300, 200, {"x": 0.1, "y": 0.2, "w": 0.5, "h": 0.5}) == (30, 40, 180, 140)
+    assert versions.crop_box(300, 200, {"x": -1, "y": 0.5, "w": 9, "h": 9}) == (0, 100, 300, 200)   # clamped
+    for bad in ({}, {"x": 0, "y": 0, "w": 0.001, "h": 0.5}, {"x": "a", "y": 0, "w": 1, "h": 1}):
+        with pytest.raises(ValueError):
+            versions.crop_box(300, 200, bad)
 
 
 # ---------------------------------------------------------------- app
@@ -168,3 +190,62 @@ def test_retouch_versions(client, tmp_path):
         time.sleep(0.05)
     shown = [i for i in client.get("/api/timeline", params={"user": "utente"}).json()["items"] if i["r"]]
     assert [i["r"] for i in shown] == [second["id"]] and shown[0]["d"].startswith("2020")
+
+
+def test_retouch_geometry(client):
+    items = client.get("/api/timeline", params={"user": "utente"}).json()["items"]
+    a = next(i for i in items if i["d"].startswith("2020"))["a"]   # shown 600 x 800
+    state = client.post(f"/api/retouch/{a}/open").json()
+    assert (state["w"], state["h"]) == (600, 800)
+
+    state = client.post(f"/api/retouch/{a}/apply", json={"tool": "rotate", "params": {"quarters": 1}}).json()
+    assert not state["busy"] and (state["w"], state["h"]) == (800, 600)   # no waiting: done at once
+    assert [s["label"] for s in state["steps"]] == ["Ruotata a destra"]
+    state = client.post(f"/api/retouch/{a}/apply", json={"tool": "rotate", "params": {"quarters": 1}}).json()
+    assert [s["label"] for s in state["steps"]] == ["Ruotata a 180°"] and (state["w"], state["h"]) == (600, 800)
+    state = client.post(f"/api/retouch/{a}/apply", json={"tool": "rotate", "params": {"quarters": -1}}).json()
+    assert [s["label"] for s in state["steps"]] == ["Ruotata a destra"]
+    state = client.post(f"/api/retouch/{a}/apply", json={"tool": "rotate", "params": {"quarters": -1}}).json()
+    assert state["steps"] == [] and (state["w"], state["h"]) == (600, 800)   # turned back: nothing left to save
+    assert client.post(f"/api/retouch/{a}/apply", json={"tool": "rotate", "params": {"quarters": 2}}).status_code == 400
+
+    crop = {"tool": "crop", "params": {"x": 0.25, "y": 0.25, "w": 0.5, "h": 0.5}}
+    state = client.post(f"/api/retouch/{a}/apply", json=crop).json()
+    assert (state["w"], state["h"]) == (300, 400) and [s["tool"] for s in state["steps"]] == ["crop"]
+    assert client.post(f"/api/retouch/{a}/apply", json={"tool": "crop", "params": {"x": 0, "y": 0, "w": 0, "h": 0}}).status_code == 400
+
+    state = client.post(f"/api/retouch/{a}/apply", json={"tool": "straighten", "params": {"angle": 3}}).json()
+    assert state["steps"][-1]["angle"] == 3 and state["w"] < 300
+    state = client.post(f"/api/retouch/{a}/apply",
+                        json={"tool": "straighten", "params": {"angle": -2.5}, "replace_last": True}).json()
+    assert [s["tool"] for s in state["steps"]] == ["crop", "straighten"] and state["steps"][-1]["angle"] == -2.5
+    assert client.post(f"/api/retouch/{a}/apply", json={"tool": "straighten", "params": {"angle": 60}}).status_code == 400
+    state = client.post(f"/api/retouch/{a}/apply",
+                        json={"tool": "straighten", "params": {"angle": 0}, "replace_last": True}).json()
+    assert [s["tool"] for s in state["steps"]] == ["crop"] and (state["w"], state["h"]) == (300, 400)
+    assert client.post(f"/api/retouch/{a}/apply", json={"tool": "straighten", "params": {"angle": 0}}).status_code == 400
+
+    # undo and redo of the crop
+    state = client.post(f"/api/retouch/{a}/undo").json()
+    assert state["steps"] == [] and state["redo"] == 1 and (state["w"], state["h"]) == (600, 800)
+    state = client.post(f"/api/retouch/{a}/redo").json()
+    assert [s["tool"] for s in state["steps"]] == ["crop"] and state["redo"] == 0 and state["w"] == 300
+    client.post(f"/api/retouch/{a}/undo")
+    client.post(f"/api/retouch/{a}/apply", json={"tool": "rotate", "params": {"quarters": 1}})
+    assert client.post(f"/api/retouch/{a}/undo").json()["redo"] == 1
+    client.post(f"/api/retouch/{a}/apply", json={"tool": "rotate", "params": {"quarters": -1}})
+    assert client.get("/api/retouch").json()["redo"] == 0   # a new step ends the redo line
+
+    saved = client.post(f"/api/retouch/{a}/save").json()
+    assert saved["replaced"] is None and (saved["version"]["w"], saved["version"]["h"]) == (800, 600)
+    assert saved["version"]["steps"] == [{"tool": "rotate", "quarters": 3}]
+    image = Image.open(io.BytesIO(client.get(f"/media/version/{saved['version']['id']}/file").content))
+    assert image.size == (800, 600)
+    shown = next(i for i in client.get("/api/timeline", params={"user": "utente"}).json()["items"] if i["a"] == a)
+    assert (shown["w"], shown["h"]) == (800, 600)   # the gallery lays out the turned photo
+
+    # editing the version again replaces it, and says which one
+    client.post(f"/api/retouch/{a}/open")
+    client.post(f"/api/retouch/{a}/apply", json={"tool": "rotate", "params": {"quarters": 1}})
+    again = client.post(f"/api/retouch/{a}/save").json()
+    assert again["replaced"] == saved["version"]["id"] and again["version"]["steps"][-1]["tool"] == "rotate"

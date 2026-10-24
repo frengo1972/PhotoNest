@@ -31,6 +31,7 @@ const seg = (attr, value, label, on) => `<button type="button" data-${attr}="${v
 // ---------------------------------------------------------------- overview
 
 function nasStep(nas) {
+  if (nas === undefined) return { done: false, text: 'Controllo dell’archivio sul NAS…', label: 'Apri' };
   if (!nas?.root) return { done: false, text: 'Scegli dove salvare l’archivio: per ora una cartella su V:, poi il NAS.', label: 'Scegli la destinazione' };
   if (!nas.exists) return { done: false, text: `La destinazione ${nas.root} non è raggiungibile.`, label: 'Controlla' };
   const p = nas.plan;
@@ -45,6 +46,7 @@ function nasStep(nas) {
 }
 
 function aiStep(ai, c) {
+  if (ai === undefined) return { done: false, text: 'Controllo delle foto analizzate…', action: '' };
   if (!ai || !ai.total) return { done: false, text: 'Dopo il primo aggiornamento, l’AI può riconoscere volti, luoghi e oggetti.', action: '' };
   if (ai.pending) {
     return {
@@ -59,14 +61,33 @@ function aiStep(ai, c) {
   return { done: true, text: `Foto analizzate: ${num(ai.tagged)} hanno etichette automatiche, ${num(ai.faces)} volti trovati.`, action: '' };
 }
 
+/** The overview is shown at once; the NAS plan and the AI counts (slower on a large archive) fill it in after. */
 export async function renderOverview(el, ctx) {
+  if (!ctx.state.user) { overviewHtml(el, ctx, null, null, null); return; }
+  overviewHtml(el, ctx, undefined, undefined, undefined);
+  const [nas, ai, vlm] = await Promise.all([
+    api.get('/api/nas').catch(() => null), api.get('/api/ai').catch(() => null), api.get('/api/vlm').catch(() => null)]);
+  if (ctx.current === 'panoramica' && el.querySelector('.steps')) overviewHtml(el, ctx, nas, ai, vlm);
+}
+
+function captionStep(vlm) {
+  if (vlm === undefined) return { done: false, text: 'Controllo delle descrizioni…', later: true };
+  if (!vlm || !vlm.total) return { done: false, text: 'Dopo il primo aggiornamento, un modello sul tuo PC può scrivere una descrizione di ogni foto.', later: true };
+  if (vlm.pending) {
+    return {
+      done: false,
+      text: `${plural(vlm.pending, 'foto senza descrizione', 'foto senza descrizione')}: un modello di linguaggio sul tuo PC scrive una frase e alcune etichette, che si possono cercare.`,
+    };
+  }
+  return { done: true, text: `Tutte le ${plural(vlm.described, 'foto', 'foto')} hanno una descrizione.` };
+}
+
+function overviewHtml(el, ctx, nas, ai, vlm) {
   const s = ctx.state;
   const c = s.counts;
-  const [nas, ai] = s.user
-    ? await Promise.all([api.get('/api/nas').catch(() => null), api.get('/api/ai').catch(() => null)])
-    : [null, null];
   const ns = nasStep(nas);
   const as = aiStep(ai, c);
+  const cs = captionStep(vlm);
   const google = s.sources.filter((x) => x.type === 'google' || x.type === 'icloud').length;
   const devices = s.sources.length - google;
   const step = (n, done, title, text, action = '', later = false) => `
@@ -105,10 +126,12 @@ export async function renderOverview(el, ctx) {
         c.issues ? go('verifica', 'Correggi', true) : '')}
       ${step(5, as.done, 'Riconosci persone e cose', esc(as.text),
         as.action === 'persone' ? go('persone', 'Dai un nome', true) : as.action)}
-      ${step(6, false, 'Ordina e sistema',
+      ${step(6, cs.done, 'Descrivi le foto', esc(cs.text),
+        cs.done || cs.later ? go('didascalie', 'Apri') : go('didascalie', 'Descrivi le foto', true), cs.later)}
+      ${step(7, false, 'Ordina e sistema',
         'Nella galleria cerca, seleziona le foto per escluderle, metterle tra le preferite, aggiungerle a un album, indicare le persone o correggere la data.',
         go('galleria', 'Apri la galleria'))}
-      ${step(7, ns.done, 'Crea l’archivio sul NAS', `${esc(ns.text)} Le foto sono ordinate per anno ed evento, con tutti i dati scritti nei file.`,
+      ${step(8, ns.done, 'Crea l’archivio sul NAS', `${esc(ns.text)} Le foto sono ordinate per anno ed evento, con tutti i dati scritti nei file.`,
         go('nas', ns.label, !ns.done && Boolean(s.user)))}
     </ol></div>`;
   el.onclick = (e) => {
@@ -205,8 +228,16 @@ const EXAMPLE_TREE = (root, user) => `<b>${esc(root || 'X:\\ArchivioFoto')}</b>
    ├ _esclusi                                 foto tolte dopo un export precedente (mai cancellate)
    └ _indice.csv                              elenco di tutti i file con le loro fonti, apribile in Excel`;
 
+/** Settings at once; what an export would do takes seconds on a large archive and fills in after. */
 export async function renderNas(el, ctx) {
+  const quick = await api.get('/api/nas?plan=false');
+  nasHtml(el, ctx, quick, quick.exists);
+  if (!quick.exists) return;
   const nas = await api.get('/api/nas');
+  if (ctx.current === 'nas' && el.querySelector('#nas-root')) nasHtml(el, ctx, nas, false);
+}
+
+function nasHtml(el, ctx, nas, planning) {
   const p = nas.plan;
   const last = nas.last;
   const pending = p ? p.copy + p.meta + p.move + p.orphans : 0;
@@ -242,7 +273,8 @@ export async function renderNas(el, ctx) {
     </div>
     ${status}
     ${nas.exiftool ? '' : '<p class="dest-status bad">Manca exiftool, necessario per scrivere i dati nei file: installalo con <code>winget install OliverBetz.ExifTool</code>.</p>'}
-    ${p ? `<h2 class="section-title">Cosa farà</h2>${stats}${action}` : ''}
+    ${p ? `<h2 class="section-title">Cosa farà</h2>${stats}${action}`
+    : planning ? '<h2 class="section-title">Cosa farà</h2><p class="hint">Confronto tra il catalogo e la destinazione…</p>' : ''}
     <div class="jobpanel-slot"></div>
     ${lastBlock}
     <h2 class="section-title">Come sarà organizzato</h2>
@@ -291,6 +323,8 @@ function eventRange(ev) {
   return a === b ? dateTime(ev.start_local) : `dal ${dateTime(ev.start_local)} al ${dateTime(ev.end_local)}`;
 }
 
+const EVENTS_PAGE = 150;
+
 export async function renderEvents(el, ctx) {
   const { events } = await api.get(`/api/events?${q({ user: ctx.user })}`);
   const row = (ev) => `
@@ -306,11 +340,29 @@ export async function renderEvents(el, ctx) {
   el.innerHTML = `<div class="page">
     ${pageHead('Eventi',
       'Le foto vicine nel tempo e nello spazio formano un evento: una gita, una festa, una giornata al mare. Il nome diventa la cartella dell’archivio, per esempio “2019-10-09 Gita al mare”.')}
-    <div class="list">${events.length ? events.map(row).join('') : emptyBlock('Nessun evento', 'Gli eventi compaiono dopo il primo aggiornamento dell’archivio.')}</div>
+    <div class="list">${events.length ? '' : emptyBlock('Nessun evento', 'Gli eventi compaiono dopo il primo aggiornamento dell’archivio.')}</div>
+    <div class="more"></div>
   </div>`;
+  // thousands of events: added a page at a time as the list is scrolled
+  const list = el.querySelector('.list');
+  const more = el.querySelector('.more');
+  let shown = 0;
+  const showMore = () => {
+    list.insertAdjacentHTML('beforeend', events.slice(shown, shown + EVENTS_PAGE).map(row).join(''));
+    shown = Math.min(events.length, shown + EVENTS_PAGE);
+    more.innerHTML = shown < events.length
+      ? `<button class="btn" type="button" data-more>Mostra altri ${num(Math.min(EVENTS_PAGE, events.length - shown))} di ${num(events.length - shown)}</button>` : '';
+  };
+  showMore();
+  const io = new IntersectionObserver((entries) => {
+    if (entries.some((x) => x.isIntersecting) && shown < events.length) showMore();
+  }, { root: el.closest('.main'), rootMargin: '1200px 0px' });
+  io.observe(more);
+  ctx.onLeave(() => io.disconnect());
   el.onclick = async (e) => {
     const t = e.target.closest('button');
     if (!t) return;
+    if ('more' in t.dataset) { showMore(); return; }
     const rowEl = t.closest('[data-event]');
     const ev = rowEl && events.find((x) => x.id === Number(rowEl.dataset.event));
     if (t.dataset.goto) { ctx.gotoDate(t.dataset.goto); return; }
@@ -378,14 +430,27 @@ function paneHtml(g, m, k, bestPixels) {
     </figure>`;
 }
 
+/** Fold a group away (height and opacity), then remove it. */
+function collapse(el) {
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) { el.remove(); return Promise.resolve(); }
+  el.style.height = `${el.offsetHeight}px`;
+  el.getBoundingClientRect();
+  el.classList.add('leaving');
+  el.style.height = '0px';
+  return new Promise((done) => { setTimeout(() => { el.remove(); done(); }, 280); });
+}
+
 function groupHtml(g) {
   const best = Math.max(...g.members.map((m) => (m.w || 0) * (m.h || 0)));
   const sources = [...new Set(g.members.map((m) => sourceLabel(m.source.type)))];
-  const tools = g.reviewed
-    ? `<span class="ok">${icon('i-check')}Controllato</span><button class="btn btn-quiet" type="button" data-review="0">Riapri</button>`
-    : `<button class="btn" type="button" data-review="1">${icon('i-check')}Va bene così</button>`;
+  const trash = `<button class="btn danger" type="button" data-trash title="Nessuna copia va tenuta: la foto va nel cestino, da cui si può rimettere">${icon('i-trash')}Elimina tutte</button>`;
+  const tools = g.excluded
+    ? `<span class="muted">${icon('i-trash')}Nel cestino</span><button class="btn" type="button" data-untrash>${icon('i-restore')}Rimetti</button>`
+    : g.reviewed
+      ? `<span class="ok">${icon('i-check')}Controllato</span><button class="btn btn-quiet" type="button" data-review="0">Riapri</button>${trash}`
+      : `${trash}<button class="btn" type="button" data-review="1">${icon('i-check')}Va bene così</button>`;
   return `
-    <article class="dgroup ${g.reviewed ? 'reviewed' : ''}" data-group="${g.id}">
+    <article class="dgroup ${g.reviewed || g.excluded ? 'reviewed' : ''}" data-group="${g.id}">
       <header class="dgroup-head">
         <div><h3>${esc(dateTime(g.date_local))}</h3><p>${plural(g.n_items, 'copia', 'copie')} da ${esc(listJoin(sources))}</p></div>
         <div class="tools">${tools}</div>
@@ -398,7 +463,7 @@ export async function renderDuplicates(el, ctx) {
   const opts = (ctx.viewState.duplicati ??= { kind: 'simili', todo: true });
   el.innerHTML = `<div class="page">
     ${pageHead('Duplicati',
-      'Ogni gruppo è la stessa foto trovata più volte. La copia con il bordo blu entra nell’archivio, con i dati di tutte le altre (posizione, album, persone). Se va bene, premi Va bene così; altrimenti scegli un’altra copia.',
+      'Ogni gruppo è la stessa foto trovata più volte. La copia con il bordo blu entra nell’archivio, con i dati di tutte le altre (posizione, album, persone). Se va bene, premi Va bene così; altrimenti scegli un’altra copia. Se la foto non serve (un documento, uno scontrino), Elimina tutte la mette nel cestino.',
       `<div class="segmented" role="group" aria-label="Tipo di copie">
          ${seg('kind', 'simili', 'Simili', opts.kind === 'simili')}${seg('kind', 'identici', 'Identiche', opts.kind === 'identici')}
        </div>
@@ -410,20 +475,44 @@ export async function renderDuplicates(el, ctx) {
   const more = el.querySelector('.more');
   const groups = new Map();
   let offset = 0;
+  let total = 0;
+
+  const showEmpty = () => {
+    list.innerHTML = opts.kind === 'simili'
+      ? emptyBlock(opts.todo ? 'Nessun gruppo da rivedere' : 'Nessuna copia simile',
+        'Qui compaiono le foto presenti in più versioni diverse, per esempio una ricompressa da Google Foto e l’originale del telefono.')
+      : emptyBlock('Nessuna copia identica', 'Qui compaiono i file identici trovati in più fonti. Sono unificati automaticamente.');
+  };
+
+  const showMore = () => {
+    more.innerHTML = offset < total
+      ? `<button class="btn" type="button" data-more>Mostra altri ${num(Math.min(PAGE, total - offset))} di ${num(total - offset)}</button>` : '';
+  };
 
   async function loadMore() {
     const data = await api.get(`/api/groups?${q({ user: ctx.user, kind: opts.kind, todo: opts.todo, offset, limit: PAGE })}`);
-    if (!offset && !data.total) {
-      list.innerHTML = opts.kind === 'simili'
-        ? emptyBlock(opts.todo ? 'Nessun gruppo da rivedere' : 'Nessuna copia simile',
-          'Qui compaiono le foto presenti in più versioni diverse, per esempio una ricompressa da Google Foto e l’originale del telefono.')
-        : emptyBlock('Nessuna copia identica', 'Qui compaiono i file identici trovati in più fonti. Sono unificati automaticamente.');
-    }
+    total = data.total;
+    if (!offset && !total) showEmpty();
     for (const g of data.groups) groups.set(g.id, g);
     list.insertAdjacentHTML('beforeend', data.groups.map(groupHtml).join(''));
     offset += data.groups.length;
-    more.innerHTML = offset < data.total
-      ? `<button class="btn" type="button" data-more>Mostra altri ${num(Math.min(PAGE, data.total - offset))} di ${num(data.total - offset)}</button>` : '';
+    showMore();
+  }
+
+  /** A group that is settled leaves the list, so the next one to check is already under the pointer. */
+  async function dismiss(art, g) {
+    const next = art.nextElementSibling;
+    groups.delete(g.id);
+    offset -= 1; // it left the list on the server too
+    total -= 1;
+    await collapse(art);
+    if (!list.querySelector('.dgroup')) {
+      if (offset < total) await loadMore(); else showEmpty();
+    }
+    showMore();
+    const target = next?.isConnected ? next : list.querySelector('.dgroup');
+    const top = target?.getBoundingClientRect().top;
+    if (top !== undefined && (top < 0 || top > innerHeight - 160)) target.scrollIntoView({ block: 'start', behavior: 'smooth' });
   }
 
   el.onclick = async (e) => {
@@ -453,12 +542,24 @@ export async function renderDuplicates(el, ctx) {
         ctx.markPending();
         return;
       }
+      if (('trash' in t.dataset || 'untrash' in t.dataset) && g) {
+        t.disabled = true;
+        const exclude = 'trash' in t.dataset;
+        await api.post('/api/assets/edit', { ids: [g.id], exclude });
+        g.excluded = exclude;
+        if (exclude && opts.todo) dismiss(art, g).catch((err) => ctx.toast(err.message)); else art.outerHTML = groupHtml(g);
+        ctx.galleryChanged();
+        ctx.refresh();
+        if (exclude) ctx.undoable('Foto e copie nel cestino', () => api.post('/api/assets/edit', { ids: [g.id], exclude: false }));
+        return;
+      }
       if (t.dataset.review && g) {
         t.disabled = true;
         await api.post('/api/review', { asset_id: g.id, value: t.dataset.review === '1' });
         g.reviewed = t.dataset.review === '1';
-        art.outerHTML = groupHtml(g);
+        if (g.reviewed && opts.todo) dismiss(art, g).catch((err) => ctx.toast(err.message)); else art.outerHTML = groupHtml(g);
         ctx.refresh();
+        if (g.reviewed) ctx.undoable('Gruppo controllato', () => api.post('/api/review', { asset_id: g.id, value: false }));
       }
     } catch (err) {
       t.disabled = false;
@@ -565,10 +666,8 @@ export async function renderVariants(el, ctx) {
         await replaceGroup(art, g);
         ctx.galleryChanged();
         if (dropped.length) {
-          ctx.toast(`${plural(dropped.length, 'scatto messo', 'scatti messi')} nel cestino`, {
-            action: 'Annulla',
-            onAction: async () => { await api.post('/api/assets/edit', { ids: dropped, exclude: false }); ctx.galleryChanged(); renderVariants(el, ctx); },
-          });
+          ctx.undoable(`${plural(dropped.length, 'scatto messo', 'scatti messi')} nel cestino`,
+            () => api.post('/api/assets/edit', { ids: dropped, exclude: false }));
         }
         return;
       }
@@ -589,13 +688,10 @@ export async function renderVariants(el, ctx) {
 
 // ---------------------------------------------------------------- dates to check
 
-export async function renderIssues(el, ctx) {
-  const data = await api.get(`/api/issues?${q({ user: ctx.user })}`);
-  const items = data.items;
-  el.innerHTML = `<div class="page">
-    ${pageHead('Date da verificare',
-      'Foto in cui fotocamera, nome del file e Google Foto indicano date diverse, oppure nessuna data. È già stata scelta la più affidabile: se è giusta confermala, altrimenti correggila.')}
-    <div class="list">${items.length ? items.map((it, k) => `
+const ISSUES_PAGE = 50;
+
+function issueHtml(it, k) {
+  return `
       <div class="issue" data-k="${k}">
         <button class="thumb" type="button" data-open="${k}" aria-label="Apri ${esc(it.filename)}"><img src="${thumbUrl(it.id, it.v)}" alt="" loading="lazy"></button>
         <div>
@@ -607,14 +703,39 @@ export async function renderIssues(el, ctx) {
             <button class="btn btn-primary" type="button" data-save="${k}">Salva questa data</button>
           </div>
         </div>
-      </div>`).join('') : emptyBlock('Tutto in ordine', 'Nessuna foto con date incoerenti o mancanti.')}
-    </div></div>`;
+      </div>`;
+}
+
+export async function renderIssues(el, ctx) {
+  el.innerHTML = `<div class="page">
+    ${pageHead('Date da verificare',
+      'Foto in cui fotocamera, nome del file e Google Foto indicano date diverse, oppure nessuna data. È già stata scelta la più affidabile: se è giusta confermala, altrimenti correggila.')}
+    <div class="list"></div><div class="more"></div></div>`;
+  const list = el.querySelector('.list');
+  const more = el.querySelector('.more');
+  const items = [];
+  let offset = 0; // position of the next page on the server: rows saved here have left the list there
+
+  async function loadMore() {
+    const data = await api.get(`/api/issues?${q({ user: ctx.user, offset, limit: ISSUES_PAGE })}`);
+    if (!items.length && !data.items.length) list.innerHTML = emptyBlock('Tutto in ordine', 'Nessuna foto con date incoerenti o mancanti.');
+    list.insertAdjacentHTML('beforeend', data.items.map((it, j) => issueHtml(it, items.length + j)).join(''));
+    items.push(...data.items);
+    offset += data.items.length;
+    const left = data.total - offset;
+    more.innerHTML = left > 0
+      ? `<button class="btn" type="button" data-more>Mostra altre ${num(Math.min(ISSUES_PAGE, left))} di ${num(left)}</button>` : '';
+  }
+
   el.onclick = async (e) => {
     const t = e.target.closest('button');
     if (!t) return;
+    if ('more' in t.dataset) { t.disabled = true; loadMore().catch((err) => { t.disabled = false; ctx.toast(err.message); }); return; }
     if (t.dataset.open !== undefined) {
-      const entries = items.map((m) => entryOf(m, { asset: m.asset, caption: m.filename }));
-      ctx.lightbox.open(entries, Number(t.dataset.open), originOf(entries, [...el.querySelectorAll('.issue .thumb')]));
+      const shown = [...el.querySelectorAll('.issue')].map((row) => items[Number(row.dataset.k)]);
+      const entries = shown.map((m) => entryOf(m, { asset: m.asset, caption: m.filename }));
+      const at = shown.indexOf(items[Number(t.dataset.open)]);
+      ctx.lightbox.open(entries, at, originOf(entries, [...el.querySelectorAll('.issue .thumb')]));
       return;
     }
     if (t.dataset.save !== undefined) {
@@ -625,6 +746,7 @@ export async function renderIssues(el, ctx) {
       try {
         await api.post('/api/assets/edit', { ids: [items[Number(t.dataset.save)].asset], date_local: raw.replace('T', ' ').padEnd(19, ':00').slice(0, 19) });
         row.remove();
+        offset -= 1;
         ctx.toast('Data salvata');
         ctx.galleryChanged();
         ctx.refresh();
@@ -634,23 +756,38 @@ export async function renderIssues(el, ctx) {
       }
     }
   };
+  await loadMore();
 }
 
 // ---------------------------------------------------------------- trash
 
-export async function renderTrash(el, ctx) {
-  const { items } = await api.get(`/api/timeline?${q({ user: ctx.user, excluded: true })}`);
-  el.innerHTML = `<div class="page">
-    ${pageHead('Cestino',
-      'Foto e video esclusi dall’archivio. Non vengono copiati sul NAS, ma restano nella cartella income: puoi rimetterli quando vuoi.',
-      items.length ? `<button class="btn" type="button" data-restore-all>${icon('i-restore')}Rimetti tutto</button>` : '')}
-    ${items.length ? `<div class="trash-grid">${items.map((it, k) => `
+const TRASH_PAGE = 300;
+
+const trashCell = (it, k) => `
       <div class="trash-cell" style="width:${Math.round(170 * Math.min(3, Math.max(0.5, it.w && it.h ? it.w / it.h : 1.5)))}px">
         <button class="shot" type="button" data-open="${k}" aria-label="Apri"><img src="${thumbUrl(it.i, it.v)}" alt="" loading="lazy"></button>
         <button class="btn restore" type="button" data-restore="${it.a}">${icon('i-restore')}Rimetti</button>
-      </div>`).join('')}</div>` : emptyBlock('Il cestino è vuoto', 'Le foto escluse dalla galleria, dalle raffiche o dal visualizzatore compaiono qui.')}
+      </div>`;
+
+export async function renderTrash(el, ctx) {
+  const first = await api.get(`/api/timeline?${q({ user: ctx.user, excluded: true, limit: TRASH_PAGE })}`);
+  const items = [...first.items];
+  el.innerHTML = `<div class="page">
+    ${pageHead('Cestino',
+      'Foto e video esclusi dall’archivio. Non vengono copiati sul NAS, ma restano nella cartella income: puoi rimetterli quando vuoi.',
+      items.length ? `<button class="btn" type="button" data-restore-all>${icon('i-restore')}Rimetti tutto (${num(first.total)})</button>` : '')}
+    ${items.length ? `<div class="trash-grid">${items.map(trashCell).join('')}</div><div class="more"></div>`
+      : emptyBlock('Il cestino è vuoto', 'Le foto escluse dalla galleria, dalle raffiche o dal visualizzatore compaiono qui.')}
   </div>`;
-  const entries = items.map((it) => ({ item: it.i, v: it.v, w: it.w, h: it.h, kind: it.k, date: it.d, asset: it.a, excluded: true }));
+  const grid = el.querySelector('.trash-grid');
+  const more = el.querySelector('.more');
+  const toEntry = (it) => ({ item: it.i, v: it.v, w: it.w, h: it.h, kind: it.k, date: it.d, asset: it.a, excluded: true });
+  const entries = items.map(toEntry);
+  const showMore = () => {
+    const left = first.total - items.length;
+    if (more) more.innerHTML = left > 0 ? `<button class="btn" type="button" data-more>Mostra altri ${num(Math.min(TRASH_PAGE, left))} di ${num(left)}</button>` : '';
+  };
+  showMore();
   el.onclick = async (e) => {
     const t = e.target.closest('button');
     if (!t) return;
@@ -659,15 +796,115 @@ export async function renderTrash(el, ctx) {
         { removeWhen: (x) => !x.excluded });
       return;
     }
-    const ids = 'restoreAll' in t.dataset ? items.map((it) => it.a) : t.dataset.restore ? [Number(t.dataset.restore)] : null;
-    if (!ids) return;
+    if ('more' in t.dataset) {
+      t.disabled = true;
+      try {
+        const page = await api.get(`/api/timeline?${q({ user: ctx.user, excluded: true, offset: items.length, limit: TRASH_PAGE })}`);
+        grid.insertAdjacentHTML('beforeend', page.items.map((it, j) => trashCell(it, items.length + j)).join(''));
+        items.push(...page.items);
+        entries.push(...page.items.map(toEntry));
+        showMore();
+      } catch (err) {
+        t.disabled = false;
+        ctx.toast(err.message);
+      }
+      return;
+    }
+    const all = 'restoreAll' in t.dataset;
+    if (!all && !t.dataset.restore) return;
     t.disabled = true;
     try {
+      const ids = all
+        ? (await api.get(`/api/timeline?${q({ user: ctx.user, excluded: true })}`)).items.map((it) => it.a)
+        : [Number(t.dataset.restore)];
       await api.post('/api/assets/edit', { ids, exclude: false });
       ctx.toast(`${plural(ids.length, 'elemento rimesso', 'elementi rimessi')} nell’archivio`);
       ctx.galleryChanged();
       await ctx.refresh();
       renderTrash(el, ctx);
+    } catch (err) {
+      t.disabled = false;
+      ctx.toast(err.message);
+    }
+  };
+}
+
+// ---------------------------------------------------------------- captions
+
+export async function renderCaptions(el, ctx) {
+  const [vlm, recent] = await Promise.all([api.get('/api/vlm'), api.get(`/api/captions/recent?${q({ user: ctx.user })}`)]);
+  const opts = (ctx.viewState.didascalie ??= { check: null });
+  const running = ctx.state.job.running;
+  const check = opts.check;
+  const checkLine = check
+    ? `<span class="vlm-check ${check.ok ? 'ok' : 'bad'}" role="status">${check.ok
+      ? `${icon('i-check')}Il modello risponde${check.model ? `: ${esc(check.model)}` : ''}` : esc(check.error)}</span>` : '';
+  const card = (it) => `
+    <article class="caption-card">
+      <img src="${thumbUrl(it.i, it.v)}" alt="" loading="lazy" draggable="false">
+      <div><p>${esc(it.text)}</p>
+        <div class="tagline">${it.tags.map((t) => `<button type="button" class="tag" data-search="${esc(t)}" title="Cerca le foto con ${esc(t)}">${esc(t)}</button>`).join('')}</div>
+      </div>
+    </article>`;
+
+  el.innerHTML = `<div class="page">
+    ${pageHead('Didascalie',
+      'Un modello di linguaggio che gira sul tuo PC guarda ogni foto e scrive una frase e alcune etichette in italiano. Si cercano dalla galleria e finiscono nei file dell’archivio sul NAS. Le foto già descritte non vengono rifatte. Per descriverne solo alcune, selezionale nella galleria e premi “Descrivi”.',
+      vlm.pending ? `<button class="btn btn-primary" type="button" data-describe ${running ? 'disabled' : ''}>Descrivi ${plural(vlm.pending, 'foto', 'foto')}</button>` : '')}
+    <div class="jobpanel-slot"></div>
+    <div class="overview-total">
+      <div><b>${num(vlm.described)}</b><span>foto descritte</span></div>
+      <div><b>${num(vlm.pending)}</b><span>da descrivere</span></div>
+    </div>
+    <h2 class="section-title">Il modello</h2>
+    <form class="vlm-form" autocomplete="off">
+      <div class="field"><label for="vlm-url">Indirizzo del server</label>
+        <input id="vlm-url" name="url" value="${esc(vlm.url)}" spellcheck="false" required>
+        <small>LM Studio, llama.cpp o un altro server con API compatibile OpenAI. Il modello deve saper leggere le immagini.</small></div>
+      <div class="field"><label for="vlm-key">Chiave API</label>
+        <input id="vlm-key" name="key" type="password" placeholder="${vlm.key_set ? 'Salvata: lascia vuoto per non cambiarla' : 'Se il server la richiede'}">
+        ${vlm.key_set ? '<small><button type="button" class="link-btn" data-key-clear>Togli la chiave salvata</button></small>' : ''}</div>
+      <div class="field"><label for="vlm-model">Modello</label>
+        <input id="vlm-model" name="model" value="${esc(vlm.model)}" placeholder="Quello caricato nel server" spellcheck="false"></div>
+      ${vlm.local ? '' : `<p class="vlm-warn">${icon('i-alert')}Questo indirizzo non è su questo PC: le foto, ridotte a 768 pixel, verrebbero inviate a quel computer.</p>`}
+      <div class="vlm-actions"><button class="btn btn-primary" type="submit">Salva e verifica</button>${checkLine}</div>
+    </form>
+    <h2 class="section-title">Ultime descrizioni</h2>
+    ${recent.items.length ? `<div class="caption-list">${recent.items.map(card).join('')}</div>`
+      : '<p class="hint">Ancora nessuna descrizione. Si può descrivere anche una foto sola: aprila nella galleria e premi “Descrivi con l’AI” nelle informazioni.</p>'}
+  </div>`;
+  const job = ctx.state.job;  // a finished scan or export is not news here
+  renderJobPanel(el.querySelector('.jobpanel-slot'), job.running || job.kind === 'caption' ? job : { running: false, lines: [] });
+
+  const save = async (key) => {
+    const data = Object.fromEntries(new FormData(el.querySelector('.vlm-form')));
+    await api.post('/api/vlm', { url: data.url, model: data.model, key: key ?? (data.key || null) });
+  };
+  el.querySelector('.vlm-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = el.querySelector('.vlm-actions .btn');
+    btn.disabled = true;
+    btn.textContent = 'Verifico…';
+    try {
+      await save();
+      opts.check = await api.post('/api/vlm/check');
+    } catch (err) {
+      opts.check = { ok: false, error: err.message };
+    }
+    renderCaptions(el, ctx);
+  });
+  el.onclick = async (e) => {
+    const t = e.target.closest('button');
+    if (!t) return;
+    try {
+      if (t.dataset.search) { ctx.searchFor(t.dataset.search); return; }
+      if ('keyClear' in t.dataset) {
+        await save('');
+        opts.check = null;
+        renderCaptions(el, ctx);
+        return;
+      }
+      if ('describe' in t.dataset) { t.disabled = true; await ctx.startJob('/api/ai/describe'); }
     } catch (err) {
       t.disabled = false;
       ctx.toast(err.message);
@@ -686,13 +923,16 @@ export function renderJobPanel(slot, job) {
     slot.innerHTML = `<div class="jobpanel" aria-live="polite">
       <h3>${esc(job.phase ?? 'Avvio')}${job.total ? `, ${num(job.done)} di ${num(job.total)}` : ''}</h3>
       <div class="bar ${job.total ? '' : 'indeterminate'}"><span style="width:${pct}%"></span></div>
-      <ol>${lines}</ol></div>`;
+      <ol>${lines}</ol>
+      ${job.cancellable ? `<div class="jobpanel-actions"><button class="btn" type="button" data-job-cancel ${job.cancelling ? 'disabled' : ''}>${job.cancelling ? 'Sto interrompendo…' : 'Interrompi'}</button></div>` : ''}
+    </div>`;
     return;
   }
   const end = new Date(job.finished_at * 1000);
   const secs = Math.max(1, Math.round(job.finished_at - job.started_at));
   slot.innerHTML = `<div class="jobpanel">
-    <h3>${job.error ? 'Aggiornamento non riuscito' : 'Archivio aggiornato'}</h3>
+    <h3>${job.kind === 'caption' ? (job.error ? 'Descrizioni non riuscite' : 'Descrizioni terminate')
+      : job.error ? 'Aggiornamento non riuscito' : 'Archivio aggiornato'}</h3>
     <p class="muted">Terminato alle ${end.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' })}, in ${plural(secs, 'secondo', 'secondi')}.</p>
     ${job.error ? `<p class="error">${esc(job.error)}</p>` : ''}
     <ol>${lines}</ol></div>`;

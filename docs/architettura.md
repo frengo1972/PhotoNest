@@ -48,6 +48,14 @@ Legge zip Takeout senza estrarli e cartelle dei telefoni. Utente e fonte ricavat
 SQLite in `work/catalog.db`. Per ogni file: utente, fonte, percorso origine, sha256, pHash,
 dimensioni, risoluzione, data scatto, GPS, persone, album, descrizione, tipo (foto/video/live).
 
+**Archivi grandi (100k+ foto).** Indici su ordine della galleria (`assets(user, excluded, date_local, id)`),
+copie → asset, eventi; lettura via `mmap` (l'app apre una connessione per richiesta e così condivide la cache
+del sistema). La galleria riceve l'archivio in forma leggera (`/api/timeline/index`: id, proporzioni e video
+per foto, raggruppati per giorno, ~2 MB per 100k foto) e impagina tutto subito; ciò che mostrano le miniature
+arriva a pagine di 200 (`/api/timeline/items`) quando i giorni si avvicinano allo schermo, e nella pagina
+esistono solo i giorni vicini. I riepiloghi lenti (piano NAS, conteggi AI, eventi, indice) restano in memoria
+finché una richiesta di modifica o un'operazione in background non cambia il catalogo.
+
 ### 4. Dedup (per utente)
 
 | Livello | Metodo | Trova |
@@ -75,7 +83,7 @@ Azioni: "Tieni questa", "Non è un duplicato", "Confermo il gruppo". Le decision
 - **Eventi**: cluster per salto temporale (es. > 3 h) + distanza GPS; nome da reverse geocoding offline.
 - **Volti**: InsightFace + clustering; i nomi già presenti in Takeout fanno da base.
 - **Scene/oggetti**: CLIP zero-shot su vocabolario controllato.
-- **Didascalie** (opzionale): VLM locale su selezione.
+- **Didascalie e etichette**: modello visione-linguaggio locale (vedi 5d), una frase in italiano per foto.
 - Output in XMP: `dc:subject` (keyword), `MWG-RS` (regioni volti), `dc:description`.
 
 ### 6. Export
@@ -103,6 +111,41 @@ Tutto gira su questo PC, nessuna foto esce. Modelli in `%LOCALAPPDATA%\photoorg\
 - Volti: gruppi di volti simili (coseno ≥ 0,45), suggerimento del nome se vicino a una persona già nominata (≥ 0,42).
   Dare un nome a un gruppo = tag "persona" su tutte le sue foto (finisce nel NAS come gli altri tag).
 - Nel NAS le etichette automatiche vanno in `Riconosciuti|…` (XMP lr:HierarchicalSubject), separate da quelle date a mano.
+
+### 5d. Didascalie con un modello visione-linguaggio (implementato)
+
+Pagina **Didascalie** dell'app. Il modello gira in un server locale con API compatibile OpenAI (LM Studio, llama.cpp:
+`/v1/chat/completions`); indirizzo, chiave API e modello si impostano nella pagina e stanno nella tabella `settings`
+(la chiave non torna mai al browser). Default `http://127.0.0.1:64884`.
+
+- Ogni foto arriva al modello una volta, ridotta a 768 px; il modello risponde in JSON con `didascalia` (una frase)
+  e `etichette` (3-8 parole chiave). Si disattiva il ragionamento (`enable_thinking: false`); se il server non conosce
+  i campi extra, la richiesta si ripete senza.
+- Salvataggio per sha256 come il resto dell'AI: didascalia in `captions`, etichette in `auto_tags` con `source = 'vlm'`
+  (il ricalcolo delle etichette CLIP cancella solo `source = 'clip'`), compiti fatti in `ai_done` (task `caption`).
+- Lavoro in background, dal più recente, un risultato salvato per volta: **Interrompi** non perde nulla e si riprende dove
+  si era finito. Errori di chiave o di server fermano tutto con un messaggio chiaro; 5 foto di fila senza risposta valida
+  fermano il lavoro. Dalla foto aperta, "Descrivi con l'AI" lavora su una foto sola.
+- Uso: la didascalia compare nelle informazioni della foto e nella vista dettagli, la ricerca la include (tutte le
+  parole della ricerca, senza badare a singolare/plurale), le etichette sono quelle "Riconosciuto automaticamente".
+  Nell'export la didascalia diventa `dc:Description` solo se la foto non ha già una descrizione; le etichette vanno in
+  `Riconosciuti|…` come quelle di CLIP.
+- Riservatezza: se l'indirizzo non è su questo PC la pagina avverte che le foto (768 px) vengono inviate lì.
+
+### 5c. Modifiche e ritocco (implementato)
+
+Il visualizzatore ha un pannello **Ritocco** (tasto `R`): ogni strumento aggiunge un passaggio a una bozza tenuta dal
+server e il risultato si salva come **nuova versione** (JPEG in `work/versions`), mai sull'originale.
+
+- **Geometria** (istantanea, senza modelli): *Ruota* di 90° (`[` e `]`; due giri opposti si annullano), *Ritaglia*
+  (riquadro trascinabile, proporzioni libere / originali / 1:1 / 4:3 / 3:2 / 16:9, toccando di nuovo si gira il formato),
+  *Raddrizza* (−45…+45° a passi di 0,1°, con griglia; si ritaglia il rettangolo più grande senza angoli vuoti, stessa densità di pixel).
+- **Annulla / Ripristina** dei passaggi (`Ctrl+Z`, `Ctrl+Maiusc+Z`) finché la versione non è salvata.
+- **Annulla globale** (`Ctrl+Z` ovunque nell'app, oppure il pulsante *Annulla* nel messaggio): le ultime 30 azioni
+  (cestino, preferite, "Va bene così", scatti scartati, ritocco salvato, ritorno all'originale) tornano indietro una alla volta.
+  Salvare un ritocco si annulla nascondendo la nuova versione e riportando quella che aveva sostituito.
+- Nei **duplicati**, "Va bene così" ed "Elimina tutte" fanno sparire il gruppo (con la lista "Da rivedere"), così il
+  prossimo da verificare è già al suo posto.
 
 ### 6b. Ricaricamento su Google Photos (opzionale)
 Dall'archivio finale, per utente, verso un account scelto.

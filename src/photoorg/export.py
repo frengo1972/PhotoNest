@@ -130,10 +130,11 @@ def metadata_args(a: sqlite3.Row, tags: dict[str, list[str]], event_name: str | 
             args += [f"-GPSLatitude={abs(lat)}", f"-GPSLatitudeRef={'N' if lat >= 0 else 'S'}",
                      f"-GPSLongitude={abs(lon)}", f"-GPSLongitudeRef={'E' if lon >= 0 else 'W'}"]
         args += [f"-XMP-exif:GPSLatitude={lat}", f"-XMP-exif:GPSLongitude={lon}"]
-    if a["description"]:
-        args += [f"-XMP-dc:Description={a['description']}"]
+    description = a["description"] or next(iter(tags.get("caption", [])), None)  # the AI caption fills in a missing description
+    if description:
+        args += [f"-XMP-dc:Description={description}"]
         if not video:
-            args += [f"-EXIF:ImageDescription={a['description']}"]
+            args += [f"-EXIF:ImageDescription={description}"]
     args += [f"-XMP-xmp:Rating={5 if a['favorite'] else 0}"]
 
     subjects, hierarchy = [], []
@@ -170,6 +171,10 @@ def _tags(conn: sqlite3.Connection) -> dict[int, dict[str, list[str]]]:
         "ORDER BY t.score DESC"
     ):
         out[asset_id]["auto"].append(tag)
+    for asset_id, text in conn.execute(
+        "SELECT a.id, c.text FROM assets a JOIN items i ON i.id = a.winner_id JOIN captions c ON c.sha256 = i.sha256"
+    ):
+        out[asset_id]["caption"].append(text)
     return out
 
 

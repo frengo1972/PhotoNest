@@ -40,6 +40,11 @@ export class Lightbox {
         <img class="lb-media" alt="" draggable="false">
         <video class="lb-media lb-video" controls playsinline hidden></video>
         <canvas class="lb-brush" hidden></canvas>
+        <div class="lb-crop" hidden>
+          <div class="crop-live"><img alt="" draggable="false"></div>
+          <div class="crop-guides"></div>
+          <div class="crop-box" data-h="move"><span class="crop-grid"></span>${['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'].map((h) => `<i data-h="${h}"></i>`).join('')}</div>
+        </div>
       </div>
       <div class="lb-brush-cursor" hidden></div>
       <header class="lb-bar">
@@ -81,6 +86,7 @@ export class Lightbox {
     this.retouchBtn = el.querySelector('[data-act="retouch"]');
     this.showOriginal = false; // a retouched photo: show the original instead of the version
     this.onChange = null; // set by the app: (change) => void
+    this.onUndo = null;   // set by the app: Ctrl+Z while browsing
     this.info = el.querySelector('.lb-info:not(.lb-edit)');
     this.cache = new Map();
     this.assetCache = new Map();
@@ -185,6 +191,22 @@ export class Lightbox {
   }
 
   load(e) {
+    if (e.item === undefined && this.fill) {
+      // a long gallery sends its photos' details a page at a time: show this one when they arrive
+      this.media = this.img;
+      this.img.hidden = false;
+      this.video.hidden = true;
+      this.video.pause();
+      this.video.removeAttribute('src');
+      this.img.removeAttribute('src');
+      this.fill(e).then(() => {
+        if (this.entry !== e || this.el.hidden || e.item === undefined) return;
+        this.load(e);
+        this.updateChrome();
+        this.preload();
+      }, () => {});
+      return;
+    }
     const isVideo = e.kind === 'video';
     this.img.hidden = isVideo;
     this.video.hidden = !isVideo;
@@ -216,7 +238,7 @@ export class Lightbox {
   preload() {
     for (const d of [1, -1, 2]) {
       const e = this.entries[this.index + d];
-      if (e && e.kind !== 'video') this.fetchFull(e);
+      if (e && e.item !== undefined && e.kind !== 'video') this.fetchFull(e);
     }
   }
 
@@ -249,12 +271,14 @@ export class Lightbox {
    * entries: [{item, v, w, h, kind, date, caption, asset?, fav?, excluded?, info?}]
    * origin: {tile(entry), reveal?(entry)} to grow from / return to the thumbnail.
    * removeWhen(entry): drop an entry from this list after an edit (e.g. excluded while browsing the archive).
+   * fill(entry): for entries without `item` yet, a promise that completes them (and their neighbours).
    */
-  open(entries, index, origin = null, { removeWhen = null } = {}) {
+  open(entries, index, origin = null, { removeWhen = null, fill = null } = {}) {
     this.entries = [...entries];
     this.index = index;
     this.origin = origin;
     this.removeWhen = removeWhen;
+    this.fill = fill;
     this.editingDate = false;
     this.showOriginal = false;
     this.returnFocus = document.activeElement;
@@ -387,7 +411,9 @@ export class Lightbox {
       this.onSearch?.(t.dataset.search);
       return;
     }
-    if (t.dataset.versionDelete) {
+    if ('caption' in t.dataset) {
+      await this.describe(e, t);
+    } else if (t.dataset.versionDelete) {
       await this.dropVersion(e, Number(t.dataset.versionDelete));
     } else if (t.dataset.tagRemove) {
       await this.changeTags(t.dataset.kind, [], [t.dataset.tagRemove]);
@@ -415,6 +441,20 @@ export class Lightbox {
     }
   }
 
+  /** Ask the local model for the caption and labels of the photo on screen (a few seconds). */
+  async describe(e, button) {
+    button.disabled = true;
+    button.textContent = 'Sto descrivendo…';
+    try {
+      await api.post(`/api/asset/${e.asset}/caption`);
+    } catch (err) {
+      this.onChange?.({ error: err.message });
+    }
+    this.assetCache.delete(e.asset);
+    await this.renderInfo();
+    this.onChange?.({ entry: e, tags: 'auto' });
+  }
+
   /** Back to the original: the version is hidden (undo puts it back). */
   async dropVersion(e, id) {
     const keep = { version: e.version, w: e.w, h: e.h };
@@ -426,25 +466,25 @@ export class Lightbox {
     }
     const a = await api.get(`/api/asset/${e.asset}`).catch(() => null);
     const w = a?.items.find((i) => i.role === 'winner');
-    Object.assign(e, { version: null, ...(w?.w ? { w: w.w, h: w.h } : {}) });
-    this.assetCache.delete(e.asset);
-    const redraw = () => {
-      if (this.entry !== e || this.el.hidden) return;
-      this.showOriginal = false;
-      this.load(e);
-      this.refit(false);
-      if (this.infoOpen) this.renderInfo();
-    };
-    redraw();
+    this.restore(e, { version: null, ...(w?.w ? { w: w.w, h: w.h } : {}) });
     this.onChange?.({
       entry: e, version: null,
       undo: async () => {
         await api.post(`/api/versions/${id}/delete`, { deleted: false });
-        Object.assign(e, keep);
-        this.assetCache.delete(e.asset);
-        redraw();
+        this.restore(e, keep);
       },
     });
+  }
+
+  /** Give an entry other contents (another version, other proportions) and redraw it if it is the one on screen. */
+  restore(e, patch) {
+    Object.assign(e, patch);
+    this.assetCache.delete(e.asset);
+    if (this.entry !== e || this.el.hidden) return;
+    this.showOriginal = false;
+    this.load(e);
+    this.refit(false);
+    if (this.infoOpen) this.renderInfo();
   }
 
   async onInfoKey(ev) {
@@ -592,6 +632,11 @@ export class Lightbox {
   onKey(e) {
     if (this.el.hidden) return;
     if (this.editor.active && e.key !== 'Tab') { this.editor.onKey(e); return; }
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'z' && !e.target.closest?.('input, textarea')) {
+      e.preventDefault();
+      this.onUndo?.();
+      return;
+    }
     if (e.altKey || e.ctrlKey || e.metaKey) return;
     const keys = {
       Escape: () => (this.zoomed ? this.toggleZoom() : this.close()),
@@ -702,6 +747,13 @@ function dateSection(a, editing) {
     ${a.date_source === 'manual' ? '<button type="button" class="link-btn" data-date-reset>Torna alla data automatica</button>' : ''}</div></section>`;
 }
 
+function captionSection(a, kind) {
+  if (kind !== 'image') return '';
+  return `<section><h3>Descrizione AI</h3>
+    ${a.caption ? `<p class="caption">${esc(a.caption)}</p>` : '<p class="sub">Ancora nessuna descrizione.</p>'}
+    <div class="row"><button type="button" class="link-btn" data-caption>${a.caption ? 'Descrivi di nuovo' : 'Descrivi con l’AI'}</button></div></section>`;
+}
+
 function retouchSection(v) {
   const steps = v.steps.map(stepLabel);
   return `<section><h3>Ritocco</h3>
@@ -731,6 +783,7 @@ export function assetInfo(a, { editingDate = false } = {}) {
     ${tagSection('album', a.albums)}
     ${tagSection('person', a.people)}
     ${tagSection('keyword', a.keywords ?? [])}
+    ${captionSection(a, w.kind)}
     ${a.auto_tags?.length ? `<section><h3>Riconosciuto automaticamente</h3><div class="chips">${a.auto_tags.map((t) =>
       `<button type="button" class="chip auto chip-link" data-search="${esc(t)}" title="Cerca le foto con ${esc(t)}">${esc(t)}</button>`).join('')}</div></section>` : ''}
     ${a.versions?.length ? retouchSection(a.versions[0]) : ''}

@@ -172,6 +172,7 @@ class Retoucher:
                 "mask": (m_in > 0).astype(np.float32)[None, None],
             })[0][0].transpose(1, 2, 0)
             filled = cv2.resize(np.clip(result, 0, 255).astype(np.uint8), (cw, ch), interpolation=cv2.INTER_CUBIC)
+            filled = _match_edges(crop, filled, m)
             soft = cv2.GaussianBlur(m.astype(np.float32), (0, 0), max(1.0, grow / 2))[:, :, None]
             out[y0:y1, x0:x1] = np.clip(crop * (1 - soft) + filled * soft, 0, 255).astype(np.uint8)
             if progress:
@@ -198,6 +199,36 @@ class Retoucher:
             if progress:
                 progress(n, len(tiles))
         return np.ascontiguousarray(out[:, :, ::-1])
+
+
+def _match_edges(crop: np.ndarray, filled: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """LaMa invents the content of a big area and may drift in colour and brightness (a grey patch in a sunny
+    face). Shift the fill so that along the edge of the area it meets the pixels just outside, and let that
+    correction fade smoothly towards the middle (normalised convolution at low resolution: cheap and seamless)."""
+    h, w = mask.shape
+    k = min(1.0, 256 / max(h, w))
+    size = (max(1, round(w * k)), max(1, round(h * k)))
+    inside = cv2.resize(mask, size, interpolation=cv2.INTER_NEAREST) > 0
+    if not inside.any() or inside.all():
+        return filled
+    band = max(2, round(max(size) / 40))
+    kernel = np.ones((3, 3), np.uint8)
+    inner = inside & ~(cv2.erode(inside.astype(np.uint8), kernel, iterations=band) > 0)
+    outer = (cv2.dilate(inside.astype(np.uint8), kernel, iterations=band) > 0) & ~inside
+    if not outer.any():
+        return filled
+    ref = cv2.resize(crop, size, interpolation=cv2.INTER_AREA).astype(np.float32)
+    new = cv2.resize(filled, size, interpolation=cv2.INTER_AREA).astype(np.float32)
+
+    def spread(values: np.ndarray, where: np.ndarray, sigma: float) -> np.ndarray:
+        weight = cv2.GaussianBlur(where.astype(np.float32), (0, 0), sigma)[:, :, None]
+        return cv2.GaussianBlur(values * where[:, :, None], (0, 0), sigma) / np.maximum(weight, 1e-4)
+
+    near = band * 1.5
+    gap = (spread(ref, outer, near) - spread(new, inner, near)) * inner[:, :, None]
+    shift = spread(gap, inner, max(2.0, 0.12 * max(size)))
+    shift = cv2.resize(shift, (w, h), interpolation=cv2.INTER_CUBIC)
+    return np.clip(filled.astype(np.float32) + shift, 0, 255).astype(np.uint8)
 
 
 def _regions(mask: np.ndarray, w: int, h: int) -> list[tuple[int, int, int, int]]:

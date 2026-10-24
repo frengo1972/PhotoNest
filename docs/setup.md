@@ -54,6 +54,7 @@ Deve mostrare la RTX 2000 Ada e una versione CUDA ≥ 12.
 |---|---|---|
 | Ricerca/tag semantici | CLIP / SigLIP | ~1–2 GB |
 | Volti | InsightFace (buffalo_l) | ~1 GB |
-| Didascalie (opzionale) | Qwen2.5-VL 7B Q4 via Ollama | ~5–6 GB |
+| Didascalie (opzionale) | un modello con visione (es. Qwen) in LM Studio o llama.cpp | ~5–6 GB |
 
-Ollama (solo per didascalie): `winget install Ollama.Ollama`.
+Didascalie: avvia il server del modello (LM Studio o llama.cpp), poi nell'app apri **Didascalie** e inserisci
+indirizzo e, se il server la richiede, la chiave API.

@@ -49,6 +49,8 @@ IDLE_EXIT_SECONDS = 180
 PROGRESS_LINE = re.compile(r"^\s*\d+/\d+\s*$")
 SWAPPED_ORIENTATIONS = (5, 6, 7, 8)
 CACHE_FOREVER = {"Cache-Control": "public, max-age=31536000, immutable"}
+STATIC_VERSIONED = re.compile(r"^/static/w\d+/(.+)$")
+READ_ONLY_POSTS = {"/api/timeline/items", "/api/assets/details"}  # POST only to send a long list of ids
 EDGE_PATHS = [
     Path(os.environ.get("ProgramFiles(x86)", "")) / "Microsoft/Edge/Application/msedge.exe",
     Path(os.environ.get("ProgramFiles", "")) / "Microsoft/Edge/Application/msedge.exe",
@@ -77,12 +79,19 @@ class Job:
         self.error: str | None = None
         self.started_at: float | None = None
         self.finished_at: float | None = None
+        self.generation = 0  # +1 when a job starts and when it ends: the catalog may have changed
+        self.cancel = threading.Event()  # asked by the user; only a job that checks it (cancellable) stops early
+        self.cancellable = False
+        self.kind = "scan"  # what the running (or last) job does; the UI words its messages after it
 
-    def start(self, fn: Callable[[Job], None]) -> bool:
+    def start(self, fn: Callable[[Job], None], cancellable: bool = False, kind: str = "scan") -> bool:
         with self._lock:
             if self.running:
                 return False
+            self.generation += 1
             self.running, self.error, self.phase = True, None, None
+            self.cancel.clear()
+            self.cancellable, self.kind = cancellable, kind
             self.done = self.total = 0
             self.lines.clear()
             self.started_at, self.finished_at = time.time(), None
@@ -96,6 +105,7 @@ class Job:
             self.error = f"{type(ex).__name__}: {ex}"
             self.log(traceback.format_exc())
         finally:
+            self.generation += 1
             self.running, self.phase = False, None
             self.finished_at = time.time()
 
@@ -114,6 +124,7 @@ class Job:
     def snapshot(self) -> dict:
         return {
             "running": self.running, "phase": self.phase, "done": self.done, "total": self.total,
+            "kind": self.kind, "cancellable": self.cancellable and self.running, "cancelling": self.cancel.is_set() and self.running,
             "lines": list(self.lines)[-8:], "error": self.error,
             "started_at": self.started_at, "finished_at": self.finished_at,
         }
@@ -143,6 +154,20 @@ def _analyze(job: Job, work: Path, library: Library) -> None:
 
     with closing(catalog.connect(work)) as conn:
         pipeline.run(conn, library, log=job.log, progress=job.progress, phase=job.set_phase)
+
+
+def _describe(job: Job, work: Path, library: Library, asset_ids: list[int] | None = None, redo: bool = False) -> None:
+    from photoorg.ai import vlm
+
+    with closing(catalog.connect(work)) as conn:
+        client = vlm.Client.from_settings(conn)
+        job.set_phase("Descrizione delle foto")
+        try:
+            vlm.run(conn, library, client, log=job.log, progress=job.progress, should_stop=job.cancel.is_set,
+                    asset_ids=asset_ids, redo=redo)
+        except vlm.VlmError as ex:
+            job.error = str(ex)
+            job.log(str(ex))
 
 
 FACE_PX = 200
@@ -204,6 +229,8 @@ MEMBER_SELECT = (  # copies of an asset, with their role in the duplicate group
 GRID_COLUMNS = (
     "a.id a, a.kind, a.date_local, a.n_items, a.variant_group, a.favorite, i.id, i.sha256, i.width, i.height, i.orientation"
 )
+FIRST_ALBUM = "(SELECT album FROM asset_albums WHERE asset_id = a.id ORDER BY album LIMIT 1) album"
+TIMELINE_ORDER = "a.date_local IS NULL, a.date_local DESC, a.id DESC"
 
 
 def _latest_versions(conn: sqlite3.Connection) -> dict[int, sqlite3.Row]:
@@ -268,6 +295,17 @@ class EventRename(BaseModel):
     name: str | None = None
 
 
+class VlmSettings(BaseModel):
+    url: str
+    key: str | None = None      # None keeps the saved key, "" removes it
+    model: str = ""
+
+
+class DescribeRequest(BaseModel):
+    ids: list[int] | None = None    # only these photos (a selection); None: every photo without a caption
+    redo: bool = False              # describe again the ones that already have a caption
+
+
 class FaceName(BaseModel):
     faces: list[int]
     name: str
@@ -294,9 +332,23 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.state.last_seen = time.monotonic()
     app.state.job = job
+    app.state.rev = 0  # +1 after every request that may have changed the catalog (all changes are POSTs)
+    summaries: dict[str, tuple[object, object]] = {}
 
     def db() -> closing[sqlite3.Connection]:
         return closing(catalog.open_db(work))
+
+    def changes() -> tuple[int, int]:
+        return app.state.rev, job.generation
+
+    def cached(name: str, key: object, compute: Callable[[], object]):
+        """Slow summaries (seconds on 100k photos) are kept until `key` changes, so moving between screens is instant."""
+        hit = summaries.get(name)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        value = compute()
+        summaries[name] = (key, value)
+        return value
 
     @app.middleware("http")
     async def touch(request, call_next):
@@ -305,7 +357,16 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
         if request.method != "GET" and origin and origin != f"http://{request.headers.get('host')}":
             return JSONResponse({"detail": "richiesta non consentita"}, status_code=403)
         app.state.last_seen = time.monotonic()
-        return await call_next(request)
+        versioned = STATIC_VERSIONED.match(request.url.path)
+        if versioned:  # /static/w<version>/js/main.js -> /static/js/main.js (see index())
+            request.scope["path"] = "/static/" + versioned[1]
+        response = await call_next(request)
+        if request.url.path.startswith("/static/"):
+            # a versioned address never changes content; others are checked each time (304 if unchanged)
+            response.headers["Cache-Control"] = CACHE_FOREVER["Cache-Control"] if versioned else "no-cache"
+        if request.method != "GET" and request.url.path not in READ_ONLY_POSTS:
+            app.state.rev += 1
+        return response
 
     # ---------- state & navigation ----------
 
@@ -318,8 +379,7 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
         """Development mode: changes when the server restarts or a web file changes; the page then reloads."""
         if not DEV:
             raise HTTPException(404, "non in modalità sviluppo")
-        newest = max(p.stat().st_mtime_ns for p in WEB.rglob("*") if p.is_file())
-        return {"build": f"{STARTED}-{newest}"}
+        return {"build": f"{STARTED}-{_web_version()}"}
 
     @app.post("/api/shutdown")
     def shutdown() -> dict:
@@ -337,7 +397,7 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
             user = user if user in users else (users[0] if users else None)
             counts = conn.execute(
                 "SELECT coalesce(sum(excluded = 0), 0) assets, coalesce(sum(kind = 'video' AND excluded = 0), 0) videos, "
-                "coalesce(sum(n_contents > 1 AND reviewed = 0), 0) duplicates, "
+                "coalesce(sum(n_contents > 1 AND reviewed = 0 AND excluded = 0), 0) duplicates, "
                 "count(DISTINCT variant_group) variants, coalesce(sum(n_items), 0) copies, "
                 "coalesce(sum(excluded), 0) excluded FROM assets WHERE user = ?", (user,)
             ).fetchone()
@@ -350,13 +410,13 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
                 "SELECT count(DISTINCT f.cluster) FROM faces f JOIN items i ON i.sha256 = f.sha256 "
                 "JOIN assets a ON a.winner_id = i.id WHERE a.user = ? AND a.excluded = 0 AND f.rejected = 0 "
                 "AND f.person IS NULL AND f.cluster IS NOT NULL", (user,)).fetchone()[0]
-            sources = [dict(r) for r in conn.execute(
+            sources = cached("sources", job.generation, lambda: [dict(r) for r in conn.execute(  # files change only in a scan
                 "SELECT s.id, s.user, s.type, s.ident, count(i.id) items, coalesce(sum(i.kind = 'image'), 0) photos, "
                 "coalesce(sum(i.kind = 'video'), 0) videos, coalesce(sum(i.kind = 'raw'), 0) raw, "
                 "coalesce(sum(i.sidecar IS NOT NULL), 0) sidecars, coalesce(sum(i.error IS NOT NULL), 0) errors, "
                 "coalesce(sum(i.size), 0) bytes FROM sources s LEFT JOIN items i ON i.source_id = s.id "
                 "GROUP BY s.id ORDER BY s.user, s.type, s.ident"
-            )]
+            )])
         known = {(s["user"], s["type"], s["ident"]) for s in sources}
         found, warnings = discover_sources(income)
         pending = [{"user": s.user, "type": s.type, "ident": s.ident} for s in found if (s.user, s.type, s.ident) not in known]
@@ -369,17 +429,72 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
         }
 
     @app.get("/api/timeline")
-    def timeline(user: str, excluded: bool = False) -> dict:
-        """Assets of the archive, newest first; excluded=true lists the trash instead."""
+    def timeline(user: str, excluded: bool = False, offset: int = 0, limit: int | None = None) -> dict:
+        """Assets of the archive, newest first; excluded=true lists the trash instead. With `limit`, one page."""
         with db() as conn:
+            total = conn.execute("SELECT count(*) FROM assets WHERE user = ? AND excluded = ?",
+                                 (user, int(excluded))).fetchone()[0]
             rows = conn.execute(
-                f"SELECT {GRID_COLUMNS}, "
-                "(SELECT album FROM asset_albums WHERE asset_id = a.id ORDER BY album LIMIT 1) album "
-                "FROM assets a JOIN items i ON i.id = a.winner_id WHERE a.user = ? AND a.excluded = ? "
-                "ORDER BY a.date_local IS NULL, a.date_local DESC, a.id DESC", (user, int(excluded))
+                f"SELECT {GRID_COLUMNS}, {FIRST_ALBUM} FROM assets a JOIN items i ON i.id = a.winner_id "
+                f"WHERE a.user = ? AND a.excluded = ? ORDER BY {TIMELINE_ORDER} LIMIT ? OFFSET ?",
+                (user, int(excluded), -1 if limit is None else limit, offset),
             ).fetchall()
             latest = _latest_versions(conn)
-        return {"items": [_grid_item(r, r["album"], latest.get(r["a"])) for r in rows]}
+        return {"total": total, "items": [_grid_item(r, r["album"], latest.get(r["a"])) for r in rows]}
+
+    @app.get("/api/timeline/index")
+    def timeline_index(user: str) -> dict:
+        """The whole archive in light form, newest first: per day its number of photos and albums, per photo
+        only the asset id, the proportions and whether it is a video. Enough for the gallery to lay out 100k
+        photos and jump to any year; what a tile shows is loaded a page at a time (/api/timeline/items)."""
+        return cached(f"index:{user}", changes(), lambda: _index(user))
+
+    def _index(user: str) -> dict:
+        out: dict = {"days": [], "a": [], "w": [], "h": [], "k": []}
+        with db() as conn:
+            latest = _latest_versions(conn)
+            # dated photos read the timeline index backwards, without sorting; undated ones go last
+            for cond, order in (("a.date_local IS NOT NULL", "a.date_local DESC, a.id DESC"),
+                                ("a.date_local IS NULL", "a.id DESC")):
+                for r in conn.execute(
+                    "SELECT a.id a, a.kind, substr(a.date_local, 1, 10) day, i.width, i.height, i.orientation "
+                    f"FROM assets a JOIN items i ON i.id = a.winner_id WHERE a.user = ? AND a.excluded = 0 AND {cond} "
+                    f"ORDER BY {order}", (user,),
+                ):
+                    days = out["days"]
+                    if days and days[-1][0] == r["day"]:
+                        days[-1][1] += 1
+                    else:
+                        days.append([r["day"], 1, []])
+                    version = latest.get(r["a"])
+                    w, h = (version["width"], version["height"]) if version else _dims(r)
+                    out["a"].append(r["a"])
+                    out["w"].append(w)
+                    out["h"].append(h)
+                    out["k"].append(int(r["kind"] == "video"))
+            albums: dict[str, list[str]] = {}
+            for day, album in conn.execute(
+                "SELECT substr(a.date_local, 1, 10), aa.album FROM asset_albums aa JOIN assets a ON a.id = aa.asset_id "
+                "WHERE a.user = ? AND a.excluded = 0 AND a.date_local IS NOT NULL GROUP BY 1, 2", (user,),
+            ):
+                albums.setdefault(day, []).append(album)
+        for d in out["days"]:
+            d[2] = albums.get(d[0], [])[:2]
+        return out
+
+    @app.post("/api/timeline/items")
+    def timeline_items(body: AssetIds) -> dict:
+        """What the gallery's tiles show, for one page of the timeline index (same order)."""
+        ids = body.ids[:2000]
+        if not ids:
+            return {"items": []}
+        with db() as conn:
+            marks = ",".join("?" * len(ids))
+            rows = {r["a"]: r for r in conn.execute(
+                f"SELECT {GRID_COLUMNS}, {FIRST_ALBUM} FROM assets a JOIN items i ON i.id = a.winner_id "
+                f"WHERE a.id IN ({marks})", ids)}
+            latest = {a: v[0] for a, v in versions.for_assets(conn, ids).items()}
+        return {"items": [_grid_item(rows[a], rows[a]["album"], latest.get(a)) for a in ids if a in rows]}
 
     @app.get("/api/names")
     def names(user: str) -> dict:
@@ -440,6 +555,7 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
             keywords = [r[0] for r in conn.execute("SELECT name FROM asset_keywords WHERE asset_id = ? ORDER BY name", (asset_id,))]
             winner_sha = conn.execute("SELECT sha256 FROM items WHERE id = ?", (a["winner_id"],)).fetchone()[0]
             auto = [r[0] for r in conn.execute("SELECT tag FROM auto_tags WHERE sha256 = ? ORDER BY score DESC", (winner_sha,))]
+            caption = conn.execute("SELECT text FROM captions WHERE sha256 = ?", (winner_sha,)).fetchone()
             event = conn.execute(
                 "SELECT e.id, e.name FROM event_assets ea JOIN events e ON e.id = ea.event_id WHERE ea.asset_id = ?",
                 (asset_id,)).fetchone()
@@ -451,7 +567,7 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
         return {
             **{k: a[k] for k in a.keys()}, "flags": a["flags"].split(",") if a["flags"] else [],
             "albums": albums, "people": people, "keywords": keywords, "variants": variants, "items": items,
-            "auto_tags": auto, "event": dict(event) if event else None,
+            "auto_tags": auto, "caption": caption[0] if caption else None, "event": dict(event) if event else None,
             "versions": [versions.describe(v) for v in retouched],
         }
 
@@ -485,12 +601,14 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
             auto = grouped(
                 f"SELECT sha256, tag FROM auto_tags WHERE sha256 IN ({','.join('?' * len(shas))}) ORDER BY score DESC",
                 shas) if shas else {}
+            captions = dict(conn.execute(
+                f"SELECT sha256, text FROM captions WHERE sha256 IN ({','.join('?' * len(shas))})", shas).fetchall()) if shas else {}
         return {"details": {r["id"]: {
             "tz": r["tz_offset_min"], "lat": r["lat"], "lon": r["lon"], "date_source": r["date_source"],
             "date_conf": r["date_conf"], "manual": bool(r["date_manual"]), "description": r["description"],
             "file": r["filename"], "size": r["size"], "make": r["make"], "model": r["model"], "source": r["source_type"],
             "albums": albums.get(r["id"], []), "people": people.get(r["id"], []), "keywords": keywords.get(r["id"], []),
-            "auto": auto.get(r["sha256"], [])[:8], "event": event.get(r["id"]),
+            "auto": auto.get(r["sha256"], [])[:8], "caption": captions.get(r["sha256"]), "event": event.get(r["id"]),
         } for r in rows}}
 
     # ---------- duplicates, variants, issues ----------
@@ -499,7 +617,7 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
     def groups(user: str, kind: str = "simili", todo: bool = True, offset: int = 0, limit: int = 20) -> dict:
         cond = "n_contents > 1" if kind == "simili" else "n_contents = 1 AND n_items > 1"
         if todo:
-            cond += " AND reviewed = 0"
+            cond += " AND reviewed = 0 AND excluded = 0"  # a group thrown away whole is decided too
         with db() as conn:
             total = conn.execute(f"SELECT count(*) FROM assets WHERE user = ? AND {cond}", (user,)).fetchone()[0]
             assets = conn.execute(
@@ -518,7 +636,8 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
                         people=[x[0] for x in conn.execute("SELECT name FROM item_people WHERE item_id = ?", (r["id"],))],
                     ))
                 out.append({"id": a["id"], "date_local": a["date_local"], "reviewed": bool(a["reviewed"]),
-                            "n_items": a["n_items"], "n_contents": a["n_contents"], "members": members})
+                            "excluded": bool(a["excluded"]), "n_items": a["n_items"], "n_contents": a["n_contents"],
+                            "members": members})
         return {"total": total, "groups": out}
 
     @app.get("/api/variants")
@@ -547,12 +666,14 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
         return {"total": total, "groups": out}
 
     @app.get("/api/issues")
-    def issues(user: str) -> dict:
+    def issues(user: str, offset: int = 0, limit: int | None = None) -> dict:
         with db() as conn:
+            total = conn.execute(f"SELECT count(*) FROM assets a WHERE a.user = ? AND {ISSUES_WHERE}", (user,)).fetchone()[0]
             rows = conn.execute(
-                f"{WINNER_SELECT} WHERE a.user = ? AND {ISSUES_WHERE} ORDER BY i.filename", (user,)
+                f"{WINNER_SELECT} WHERE a.user = ? AND {ISSUES_WHERE} ORDER BY i.filename, a.id LIMIT ? OFFSET ?",
+                (user, -1 if limit is None else limit, offset),
             ).fetchall()
-        return {"items": [
+        return {"total": total, "items": [
             _item(r, asset=r["asset_id"], exif_dt=r["exif_dt"], google_utc=r["json_taken_utc"],
                   flags=r["flags"].split(",") if r["flags"] else [])
             for r in rows
@@ -596,22 +717,30 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
     def job_state() -> dict:
         return job.snapshot()
 
+    @app.post("/api/job/cancel")
+    def job_cancel() -> dict:
+        if job.running and job.cancellable:
+            job.cancel.set()
+        return job.snapshot()
+
     # ---------- NAS archive ----------
 
-    def nas_status(conn: sqlite3.Connection) -> dict:
+    def nas_status(conn: sqlite3.Connection, with_plan: bool = True) -> dict:
+        """with_plan=False answers at once; the plan goes through every photo (seconds on a large archive)."""
         root = catalog.get_setting(conn, export.SETTING_ROOT)
         status = {"root": root, "exiftool": bool(find_exiftool()), "last": export.last_summary(conn),
                   "exists": False, "free": None, "plan": None}
         if root and Path(root).is_dir():
             status["exists"] = True
             status["free"] = shutil.disk_usage(root).free
-            status["plan"] = export.plan(conn, root).summary()
+            if with_plan:
+                status["plan"] = cached("plan", (root, changes()), lambda: export.plan(conn, root).summary())
         return status
 
     @app.get("/api/nas")
-    def nas() -> dict:
+    def nas(plan: bool = True) -> dict:
         with db() as conn:
-            return nas_status(conn)
+            return nas_status(conn, plan)
 
     @app.post("/api/nas")
     def nas_save(body: NasSettings) -> dict:
@@ -674,13 +803,92 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
         from photoorg.ai import pipeline
 
         with db() as conn:
-            return pipeline.status(conn)
+            return cached("ai", changes(), lambda: pipeline.status(conn))
 
     @app.post("/api/ai/analyze")
     def ai_analyze() -> dict:
         if not job.start(lambda j: _analyze(j, work, library)):
             raise HTTPException(409, "un’operazione è già in corso")
         return job.snapshot()
+
+    def vlm_state(conn: sqlite3.Connection) -> dict:
+        from urllib.parse import urlparse
+
+        from photoorg.ai import vlm
+
+        client = vlm.Client.from_settings(conn)
+        host = urlparse(client.url).hostname or ""
+        return {
+            "url": client.url, "model": client.model, "key_set": bool(client.key),
+            "local": vlm.is_local_host(host),  # photos go to this address: anything else leaves the PC
+            **cached("vlm", changes(), lambda: vlm.status(conn)),
+        }
+
+    @app.get("/api/vlm")
+    def vlm_get() -> dict:
+        with db() as conn:
+            return vlm_state(conn)
+
+    @app.post("/api/vlm")
+    def vlm_save(body: VlmSettings) -> dict:
+        from urllib.parse import urlparse
+
+        from photoorg.ai import vlm
+
+        url = vlm.normalize_url(body.url)
+        parts = urlparse(url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise HTTPException(400, "indirizzo non valido: deve cominciare con http:// o https://")
+        with db() as conn:
+            catalog.set_setting(conn, vlm.SETTING_URL, url)
+            catalog.set_setting(conn, vlm.SETTING_MODEL, body.model.strip())
+            if body.key is not None:
+                catalog.set_setting(conn, vlm.SETTING_KEY, body.key.strip())
+            return vlm_state(conn)
+
+    @app.post("/api/vlm/check")
+    def vlm_check() -> dict:
+        from photoorg.ai import vlm
+
+        with db() as conn:
+            client = vlm.Client.from_settings(conn)
+        try:
+            return {"ok": True, **client.check()}
+        except vlm.VlmError as ex:
+            return {"ok": False, "error": str(ex)}
+
+    @app.post("/api/ai/describe")
+    def ai_describe(body: DescribeRequest = DescribeRequest()) -> dict:
+        if not job.start(lambda j: _describe(j, work, library, body.ids, body.redo), cancellable=True, kind="caption"):
+            raise HTTPException(409, "un’operazione è già in corso")
+        return job.snapshot()
+
+    @app.get("/api/captions/recent")
+    def captions_recent(user: str, limit: int = 12) -> dict:
+        """The latest descriptions of a user's photos, to judge the model at a glance."""
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT a.id AS asset, i.id AS item, i.sha256, c.text FROM captions c JOIN items i ON i.sha256 = c.sha256 "
+                "JOIN assets a ON a.winner_id = i.id WHERE a.user = ? AND a.excluded = 0 "
+                "GROUP BY c.sha256 ORDER BY c.created_at DESC, c.rowid DESC LIMIT ?", (user, max(1, min(limit, 50)))).fetchall()
+            tag_rows = conn.execute(
+                f"SELECT sha256, tag FROM auto_tags WHERE source = 'vlm' AND sha256 IN ({','.join('?' * len(rows))})",
+                [r["sha256"] for r in rows]).fetchall() if rows else []
+        by_sha: dict[str, list[str]] = {}
+        for sha, tag in tag_rows:
+            by_sha.setdefault(sha, []).append(tag)
+        return {"items": [{"a": r["asset"], "i": r["item"], "v": _v(r), "text": r["text"], "tags": by_sha.get(r["sha256"], [])}
+                          for r in rows]}
+
+    @app.post("/api/asset/{asset_id}/caption")
+    def asset_caption(asset_id: int) -> dict:
+        from photoorg.ai import vlm
+
+        with db() as conn:
+            try:
+                return vlm.describe_asset(conn, library, vlm.Client.from_settings(conn), asset_id)
+            except vlm.VlmError as ex:
+                raise HTTPException(ex.status if ex.status in (400, 404, 422) and not ex.fatal else 502, str(ex)) from ex
 
     @app.get("/api/people")
     def people(user: str) -> dict:
@@ -798,12 +1006,16 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
     def retouch_undo(asset_id: int) -> dict:
         return retouching(lambda: retouch.undo(asset_id))
 
+    @app.post("/api/retouch/{asset_id}/redo")
+    def retouch_redo(asset_id: int) -> dict:
+        return retouching(lambda: retouch.redo(asset_id))
+
     @app.post("/api/retouch/{asset_id}/save")
     def retouch_save(asset_id: int) -> dict:
         with db() as conn:
-            version_id = retouching(lambda: retouch.save(conn, asset_id))
+            version_id, replaced = retouching(lambda: retouch.save(conn, asset_id))
             row = conn.execute("SELECT * FROM versions WHERE id = ?", (version_id,)).fetchone()
-        return {"version": versions.describe(row)}
+        return {"version": versions.describe(row), "replaced": replaced}
 
     @app.post("/api/retouch/prepare/{tool}")
     def retouch_prepare(tool: str) -> dict:
@@ -825,6 +1037,9 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
 
     @app.get("/api/events")
     def list_events(user: str) -> dict:
+        return cached(f"events:{user}", changes(), lambda: _events(user))
+
+    def _events(user: str) -> dict:
         with db() as conn:
             rows = conn.execute(  # cover: favourite first, then the sharpest photo of the event
                 "SELECT e.*, c.id AS cover_id, c.sha256 AS cover_sha FROM events e "
@@ -888,9 +1103,9 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
         return _preview(item_id, "full")
 
     @app.get("/media/retouch/{asset_id}")
-    def retouch_preview(asset_id: int) -> Response:
+    def retouch_preview(asset_id: int, base: bool = False) -> Response:
         try:
-            data = retouch.preview(asset_id)
+            data = retouch.preview(asset_id, base=base)
         except LookupError as ex:
             raise HTTPException(404, str(ex)) from ex
         return Response(data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
@@ -928,11 +1143,19 @@ def create_app(work: Path, income: Path, tz: str = "Europe/Rome") -> FastAPI:
     # ---------- UI ----------
 
     @app.get("/")
-    def index() -> FileResponse:
-        return FileResponse(WEB / "index.html", headers={"Cache-Control": "no-cache"})
+    def index() -> Response:
+        """The page asks for CSS and scripts at addresses that change with them (modules imported by main.js too,
+        being relative): the browser can never mix an old file with new ones after an update."""
+        html = (WEB / "index.html").read_text(encoding="utf-8").replace('"/static/', f'"/static/w{_web_version()}/')
+        return Response(html, media_type="text/html", headers={"Cache-Control": "no-cache"})
 
     app.mount("/static", StaticFiles(directory=WEB), name="static")
     return app
+
+
+def _web_version() -> int:
+    """Changes whenever a file of the web UI changes."""
+    return max(p.stat().st_mtime_ns for p in WEB.rglob("*") if p.is_file())
 
 
 def _placeholder(kind: str) -> bytes:

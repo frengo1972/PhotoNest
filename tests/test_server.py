@@ -1,4 +1,5 @@
 import io
+import re
 import time
 
 import pytest
@@ -77,8 +78,13 @@ def test_scan_and_browse(client):
     assert Image.open(io.BytesIO(full.content)).size == (600, 800)  # rotated upright
     assert client.get(f"/media/file/{items[0]['i']}").status_code == 200
 
-    assert client.get("/").status_code == 200
+    page = client.get("/").text
     assert client.get("/static/js/main.js").status_code == 200
+    # the page asks for versioned addresses, so an update can never mix old and new files in the browser's cache
+    [css] = re.findall(r'href="(/static/w\d+/app\.css)"', page)
+    versioned = client.get(css.replace("app.css", "js/gallery.js"))  # how main.js imports it
+    assert versioned.status_code == 200 and "immutable" in versioned.headers["cache-control"]
+    assert client.get("/static/app.css").headers["cache-control"] == "no-cache"
 
 
 def test_rescan_after_files_removed(client, tmp_path):
@@ -151,3 +157,40 @@ def test_decisions_validation_and_rebuild(client):
     assert client.post("/api/review", json={"asset_id": 999, "value": True}).status_code == 404
     assert client.post("/api/rebuild").json() == {"ok": True}
     assert client.get("/api/groups", params={"user": "utente", "kind": "identici", "todo": False}).json()["total"] == 1
+
+
+def test_timeline_index_and_pages(client):
+    _scan(client)
+    full = _timeline(client)
+    index = client.get("/api/timeline/index", params={"user": "utente"}).json()
+    assert index["a"] == [i["a"] for i in full]  # same order as the full timeline, newest first
+    assert [(w, h) for w, h in zip(index["w"], index["h"])] == [(i["w"], i["h"]) for i in full]
+    assert index["k"] == [0, 0, 0]
+    assert [d[0] for d in index["days"]] == ["2020-05-01", "2019-10-09"] and sum(d[1] for d in index["days"]) == 3
+    page = client.post("/api/timeline/items", json={"ids": index["a"][::-1]}).json()["items"]
+    assert page == full[::-1]  # what the tiles show, in the order asked
+
+    # an edit is seen at once (the index is kept only until something changes)
+    client.post("/api/assets/edit", json={"ids": [index["a"][0]], "exclude": True})
+    assert client.get("/api/timeline/index", params={"user": "utente"}).json()["a"] == index["a"][1:]
+    trash = client.get("/api/timeline", params={"user": "utente", "excluded": True, "limit": 1}).json()
+    assert trash["total"] == 1 and [i["a"] for i in trash["items"]] == index["a"][:1]
+    assert client.get("/api/timeline", params={"user": "utente", "limit": 1, "offset": 1}).json()["items"] == full[2:]
+
+
+def test_duplicate_group_thrown_away_whole(client):
+    _scan(client)
+    [group] = client.get("/api/groups", params={"user": "utente", "kind": "identici"}).json()["groups"]
+    assert not group["excluded"]
+    client.post("/api/assets/edit", json={"ids": [group["id"]], "exclude": True})
+    assert client.get("/api/groups", params={"user": "utente", "kind": "identici"}).json()["total"] == 0  # decided
+    [shown] = client.get("/api/groups", params={"user": "utente", "kind": "identici", "todo": False}).json()["groups"]
+    assert shown["excluded"]
+
+
+def test_edit_a_huge_selection(client):
+    _scan(client)
+    a = _timeline(client)[0]["a"]
+    # more ids than SQLite takes in one query (32766)
+    assert client.post("/api/assets/edit", json={"ids": [a] * 40000, "favorite": True}).status_code == 200
+    assert _timeline(client)[0]["f"] == 1

@@ -32,7 +32,10 @@ JPEG_QUALITY = 95
 MAX_STEPS = 12
 EXIF_ORIENTATION = 274
 TOOL_LABELS = {"color": "Colori migliorati", "faces": "Volti ripristinati", "inpaint": "Macchie rimosse",
-               "upscale": "Ingrandita"}
+               "upscale": "Ingrandita", "rotate": "Ruotata", "crop": "Ritagliata", "straighten": "Raddrizzata"}
+GEOMETRY = ("rotate", "crop", "straighten")   # instant, no model: run while the request waits
+MAX_STRAIGHTEN = 45.0
+MIN_CROP_PX = 16
 
 
 def versions_dir(work: Path) -> Path:
@@ -46,9 +49,9 @@ def item_row(work: Path, v: sqlite3.Row | dict) -> dict:
             "member": f"{sha[:2]}/{sha}.jpg", "filename": f"{sha[:12]}.jpg", "size": v["size"]}
 
 
-ASSET_VERSIONS = (  # versions of each asset: made from any of its copies
-    "SELECT DISTINCT ai.asset_id, v.* FROM versions v JOIN items i ON i.sha256 = v.base_sha "
-    "JOIN asset_items ai ON ai.item_id = i.id WHERE v.deleted = 0"
+ASSET_VERSIONS = (  # versions of each asset: made from any of its copies (CROSS JOIN: start from the few versions)
+    "SELECT DISTINCT ai.asset_id, v.* FROM versions v CROSS JOIN items i ON i.sha256 = v.base_sha "
+    "CROSS JOIN asset_items ai ON ai.item_id = i.id WHERE v.deleted = 0"
 )
 
 
@@ -108,12 +111,17 @@ def load_bgr(data: bytes) -> tuple[np.ndarray, bytes | None, bytes | None]:
 
 def encode_jpeg(bgr: np.ndarray, exif: bytes | None = None, icc: bytes | None = None,
                 box: tuple[int, int] | None = None, quality: int = JPEG_QUALITY) -> bytes:
-    im = Image.fromarray(np.ascontiguousarray(bgr[:, :, ::-1]))
     if box:
-        im.thumbnail(box, Image.Resampling.LANCZOS)
+        import cv2
+
+        h, w = bgr.shape[:2]
+        k = min(1.0, box[0] / max(w, h), box[1] / max(w, h))
+        if k < 1:   # INTER_AREA is several times faster than Lanczos on a big photo, and as clean for a reduction
+            bgr = cv2.resize(bgr, (max(1, round(w * k)), max(1, round(h * k))), interpolation=cv2.INTER_AREA)
+    im = Image.fromarray(np.ascontiguousarray(bgr[:, :, ::-1]))
     buf = io.BytesIO()
     extra = {k: v for k, v in (("exif", exif), ("icc_profile", icc)) if v}
-    im.save(buf, "JPEG", quality=quality, subsampling=0 if quality >= 90 else 2, progressive=True, **extra)
+    im.save(buf, "JPEG", quality=quality, subsampling=0 if quality >= 90 else 2, progressive=quality >= 90, **extra)  # previews: baseline, faster
     return buf.getvalue()
 
 
@@ -126,6 +134,40 @@ def decode_mask(data_url: str, size: tuple[int, int]) -> np.ndarray:
     return (np.asarray(alpha) > 40).astype(np.uint8) * 255
 
 
+def turn(bgr: np.ndarray, quarters: int) -> np.ndarray:
+    """Rotate by quarter turns clockwise (1 = 90° right, 3 = 90° left)."""
+    return np.ascontiguousarray(np.rot90(bgr, -(quarters % 4)))
+
+
+def straighten(bgr: np.ndarray, angle: float) -> np.ndarray:
+    """Rotate by `angle` degrees clockwise and crop to the largest rectangle with the photo's proportions that
+    has no empty corner, so the pixel density stays the same."""
+    import cv2
+
+    h, w = bgr.shape[:2]
+    rad = np.radians(abs(angle))
+    sin, cos = np.sin(rad), np.cos(rad)
+    k = min(w / (w * cos + h * sin), h / (w * sin + h * cos))
+    ow, oh = max(1, round(w * k)), max(1, round(h * k))
+    m = cv2.getRotationMatrix2D((w / 2, h / 2), -angle, 1.0)   # OpenCV turns counter-clockwise
+    m[0, 2] += ow / 2 - w / 2
+    m[1, 2] += oh / 2 - h / 2
+    return cv2.warpAffine(bgr, m, (ow, oh), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+
+def crop_box(width: int, height: int, params: dict) -> tuple[int, int, int, int]:
+    """Pixel box (x0, y0, x1, y1) of a crop given as fractions of the image."""
+    try:
+        x, y, w, h = (float(params[k]) for k in ("x", "y", "w", "h"))
+    except (KeyError, TypeError, ValueError) as ex:
+        raise ValueError("indica l’area da ritagliare") from ex
+    x0, y0 = max(0, round(x * width)), max(0, round(y * height))
+    x1, y1 = min(width, round((x + w) * width)), min(height, round((y + h) * height))
+    if x1 - x0 < MIN_CROP_PX or y1 - y0 < MIN_CROP_PX:
+        raise ValueError("l’area da ritagliare è troppo piccola")
+    return x0, y0, x1, y1
+
+
 # ---------------------------------------------------------------- draft
 
 @dataclass
@@ -136,9 +178,11 @@ class Draft:
     icc: bytes | None
     images: list[np.ndarray]                     # start image, then one per step
     steps: list[dict] = field(default_factory=list)
+    undone: list[tuple[np.ndarray, dict]] = field(default_factory=list)   # steps taken back, last undone last
     inherited: list[dict] = field(default_factory=list)   # steps of the version the draft started from
     from_version: int | None = None
     preview: bytes | None = None
+    base_preview: tuple[np.ndarray, bytes] | None = None   # (source image, its JPEG) for the live levelling
 
     @property
     def image(self) -> np.ndarray:
@@ -180,7 +224,9 @@ class RetouchSession:
             h, w = d.image.shape[:2]
             out |= {
                 "w": w, "h": h, "from_version": d.from_version,
-                "steps": [{"tool": s["tool"], "label": label(s)} for s in d.steps],
+                "steps": [{"tool": s["tool"], "label": label(s), **({"angle": s["angle"]} if "angle" in s else {})}
+                          for s in d.steps],
+                "redo": len(d.undone),
                 "upscale": upscale_options(w, h),
                 "downloads": {tool: mb for tool, (names, mb) in models.RETOUCH_MODELS.items() if models.missing(names)},
             }
@@ -240,16 +286,67 @@ class RetouchSession:
         d = self._check(asset_id)
         if tool not in TOOL_LABELS:
             raise ValueError("strumento sconosciuto")
+        if tool == "rotate" and d.steps and d.steps[-1]["tool"] == "rotate":
+            replace_last = True   # turning again just changes the quarter turns of the last step
         if replace_last and (not d.steps or d.steps[-1]["tool"] != tool):
             replace_last = False
         if not replace_last and len(d.steps) >= MAX_STEPS:
             raise ValueError("troppi passaggi: salva la versione e continua da lì")
         source = d.images[-2] if replace_last else d.image
+        if tool in GEOMETRY:
+            self._geometry(d, tool, params, source, replace_last)
+            return self.state()
         params = self._validate(tool, params, source)
         with self._lock:
             self.busy, self.error, self.phase, self.done, self.total = True, None, None, 0, 0
         threading.Thread(target=self._run, args=(d, tool, params, source, replace_last), daemon=True).start()
         return self.state()
+
+    def _geometry(self, d: Draft, tool: str, params: dict, source: np.ndarray, replace_last: bool) -> None:
+        """Rotate / crop / straighten: quick enough to be done before answering."""
+        h, w = source.shape[:2]
+        step: dict = {"tool": tool}
+        if tool == "rotate":
+            quarters = int(params.get("quarters", 1))
+            if quarters not in (1, -1):
+                raise ValueError("rotazione non valida")
+            if replace_last:
+                quarters += d.steps[-1]["quarters"]
+            quarters %= 4
+            if not quarters:   # turned back to where it started: the step is gone
+                with self._lock:
+                    d.images.pop()
+                    d.steps.pop()
+                    d.undone.clear()
+                    d.preview = None
+                    self.rev += 1
+                return
+            result, step["quarters"] = turn(source, quarters), quarters
+        elif tool == "crop":
+            x0, y0, x1, y1 = crop_box(w, h, params)
+            result = np.ascontiguousarray(source[y0:y1, x0:x1])
+            step["box"] = [x0, y0, x1, y1]
+        else:
+            angle = round(float(params.get("angle", 0)), 1)
+            if abs(angle) > MAX_STRAIGHTEN:
+                raise ValueError(f"l’inclinazione massima è di {MAX_STRAIGHTEN:g}°")
+            if not angle:
+                if not replace_last:
+                    raise ValueError("scegli un angolo diverso da zero")
+                result = None
+            else:
+                result, step["angle"] = straighten(source, angle), angle
+        with self._lock:
+            if replace_last:
+                d.images.pop()
+                d.steps.pop()
+            if result is not None:
+                d.images.append(result)
+                d.steps.append(step)
+            d.undone.clear()
+            d.preview = None
+            self.rev += 1
+        self.error = None
 
     def _validate(self, tool: str, params: dict, image: np.ndarray) -> dict:
         from photoorg.ai.retouch import upscale_options
@@ -318,6 +415,7 @@ class RetouchSession:
                         d.images.append(result)
                         d.steps.append(step)
                     d.preview = preview
+                    d.undone.clear()
                     self.rev += 1
         except ValueError as ex:
             self.error = str(ex)
@@ -331,21 +429,39 @@ class RetouchSession:
         d = self._check(asset_id)
         if d.steps:
             with self._lock:
-                d.steps.pop()
-                d.images.pop()
+                d.undone.append((d.images.pop(), d.steps.pop()))
                 d.preview = None
                 self.rev += 1
         return self.state()
 
-    def preview(self, asset_id: int) -> bytes:
+    def redo(self, asset_id: int) -> dict:
+        d = self._check(asset_id)
+        if d.undone:
+            with self._lock:
+                image, step = d.undone.pop()
+                d.images.append(image)
+                d.steps.append(step)
+                d.preview = None
+                self.rev += 1
+        return self.state()
+
+    def preview(self, asset_id: int, base: bool = False) -> bytes:
+        """The draft as a screen-size JPEG; with `base`, the image a levelling step starts from (the one before
+        the newest step when that is a levelling, else the draft itself): the viewer turns it live while dragging."""
         d = self.draft
         if d is None or d.asset_id != asset_id:
             raise LookupError("nessun ritocco aperto per questa foto")
+        if base:
+            source = d.images[-2] if d.steps and d.steps[-1]["tool"] == "straighten" else d.image
+            if d.base_preview is None or d.base_preview[0] is not source:
+                d.base_preview = (source, encode_jpeg(source, box=SIZES["full"][0], quality=88))
+            return d.base_preview[1]
         if d.preview is None:
             d.preview = encode_jpeg(d.image, box=SIZES["full"][0], quality=88)
         return d.preview
 
-    def save(self, conn: sqlite3.Connection, asset_id: int) -> int:
+    def save(self, conn: sqlite3.Connection, asset_id: int) -> tuple[int, int | None]:
+        """Write the draft as a version: (its id, the id of the version it replaced, hidden now, if any)."""
         d = self._check(asset_id)
         if not d.steps:
             raise ValueError("nessuna modifica da salvare")
@@ -353,10 +469,11 @@ class RetouchSession:
         data = encode_jpeg(d.image, d.exif, d.icc)
         steps = [{k: v for k, v in s.items() if k != "seconds"} for s in d.inherited + d.steps]
         version_id = store(conn, self.work, d.base_sha, data, (w, h), steps)
-        if d.from_version and d.from_version != version_id:  # the new version contains its steps: one is enough
-            set_deleted(conn, d.from_version, True)
+        replaced = d.from_version if d.from_version and d.from_version != version_id else None
+        if replaced:  # the new version contains its steps: one is enough
+            set_deleted(conn, replaced, True)
         self.draft = None
-        return version_id
+        return version_id, replaced
 
 
 def label(step: dict) -> str:
@@ -365,4 +482,8 @@ def label(step: dict) -> str:
         return f"{text} ×{step['scale']}"
     if step["tool"] == "faces" and step.get("faces"):
         return f"{text} ({step['faces']})"
+    if step["tool"] == "rotate":
+        return f"{text} a {'destra' if step['quarters'] == 1 else 'sinistra' if step['quarters'] == 3 else '180°'}"
+    if step["tool"] == "straighten":
+        return f"{text} di {abs(step['angle']):g}° {'a destra' if step['angle'] > 0 else 'a sinistra'}".replace(".", ",")
     return text

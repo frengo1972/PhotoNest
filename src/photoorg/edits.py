@@ -15,6 +15,7 @@ TAG_TABLES = {"album": ("asset_albums", "album"), "person": ("asset_people", "na
 DATE_FMT = "%Y-%m-%d %H:%M:%S"
 MAX_TAG = 80
 NOW = "strftime('%Y-%m-%d %H:%M:%f', 'now')"
+IDS_PER_QUERY = 10000
 
 
 def clean_tag(name: str) -> str:
@@ -22,13 +23,14 @@ def clean_tag(name: str) -> str:
 
 
 def _winners(conn: sqlite3.Connection, asset_ids: list[int]) -> dict[int, str]:
-    if not asset_ids:
-        return {}
-    marks = ",".join("?" * len(asset_ids))
-    rows = conn.execute(
-        f"SELECT a.id, i.sha256 FROM assets a JOIN items i ON i.id = a.winner_id WHERE a.id IN ({marks})", asset_ids
-    ).fetchall()
-    found = {r[0]: r[1] for r in rows if r[1]}
+    found: dict[int, str] = {}
+    for start in range(0, len(asset_ids), IDS_PER_QUERY):  # SQLite takes at most 32766 parameters
+        chunk = asset_ids[start:start + IDS_PER_QUERY]
+        marks = ",".join("?" * len(chunk))
+        rows = conn.execute(
+            f"SELECT a.id, i.sha256 FROM assets a JOIN items i ON i.id = a.winner_id WHERE a.id IN ({marks})", chunk
+        ).fetchall()
+        found.update((r[0], r[1]) for r in rows if r[1])
     if len(found) != len(set(asset_ids)):
         raise ValueError("foto non trovata")
     return found
