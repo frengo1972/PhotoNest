@@ -28,7 +28,7 @@ Legge zip Takeout senza estrarli e cartelle dei telefoni. Utente e fonte ricavat
 - Ogni data va **validata** (range plausibile, es. 1990–oggi): EXIF e JSON possono essere entrambi sbagliati.
 - Fuso orario: EXIF di solito è ora locale senza offset, JSON è UTC → la differenza dà l'offset.
 
-#### Osservazioni dal primo Takeout reale (data di prova, account utente, album "Gita al mare 2019-10-09")
+#### Osservazioni da un archivio di prova
 
 - **Nomi localizzati**: cartelle anno `Foto da AAAA` (non `Photos from AAAA`), metadati album in `metadati.json`.
   Il codice non deve dipendere dalla lingua.
@@ -37,7 +37,7 @@ Legge zip Takeout senza estrarli e cartelle dei telefoni. Utente e fonte ricavat
   (il `(1)` va dopo `metadata`, non dopo il nome).
 - Le due `_DSC2630` sono **varianti**, non copie: stessa data EXIF e stessa fotocamera, ma una è ritagliata
   (3310×2137) e l'altra intera (4898×3267). Il dedup deve distinguere *duplicato* da *variante* (ritaglio/modifica).
-- **Risparmio spazio**: foto Sony A7R II (42 MP originali) presenti a ~4898×3267 = 16 MP → ridimensionate da Google.
+- **Risparmio spazio**: foto da 42 MP presenti a ~4898×3267 = 16 MP → ridimensionate da Google.
   Gli originali vanno cercati altrove (HD, NAS); se trovati, vincono sempre sulla copia cloud.
 - **Date sbagliate ovunque**: `2015-02-13_267.JPG` ha EXIF `4501:01:01`, JSON `13/07/1972`; quella giusta è nel nome file.
 - **Descrizioni automatiche**: caricamenti via MultCloud hanno `description` = "… Uploaded by MultCloud at …"

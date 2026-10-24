@@ -36,7 +36,7 @@ Richiede `adb` (vedi [setup.md](setup.md)).
 
 ```powershell
 adb devices                       # deve comparire il telefono
-$dst = "income\utente\android-pixel7"
+$dst = "income\utente\android-telefono"
 adb pull -a /sdcard/DCIM      "$dst\DCIM"
 adb pull -a /sdcard/Pictures  "$dst\Pictures"
 adb pull -a /sdcard/Movies    "$dst\Movies"

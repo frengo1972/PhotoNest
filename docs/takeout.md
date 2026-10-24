@@ -1,7 +1,7 @@
 # Export da Google Photos con Takeout — passo passo
 
-Da ripetere **per ogni account Google** (tuoi e delle figlie). Le figlie, maggiorenni, lo fanno
-dal proprio account e ti passano gli zip (chiavetta, link, cartella condivisa).
+Da ripetere **per ogni account Google** che vuoi includere nell'archivio. Ogni titolare dell'account
+deve scaricare i propri zip e trasferirli con il metodo che preferisce.
 
 > Perché Takeout: dal 31/03/2025 l'API di Google Photos non permette più di leggere l'intera libreria.
 > Takeout è l'unico modo per avere **originali + tutti i metadati**.
@@ -27,7 +27,7 @@ Su [photos.google.com](https://photos.google.com) con l'account giusto:
 3. Scorri fino a **"Google Foto"** e spunta solo quella.
 4. Clicca **"Tutti gli album di foto inclusi"**:
    - **primo test**: deseleziona tutto e scegli **un solo album piccolo** (o un anno, es. "Photos from 2023").
-     Serve a me per scrivere il codice sui dati reali. Si fa in pochi minuti.
+     Permette di verificare il flusso prima dell'export completo. Si fa in pochi minuti.
    - **export completo**: lascia tutto selezionato.
    - Lascia invariata l'opzione formati (se presente).
 5. In fondo: **"Passaggio successivo"**.
@@ -36,7 +36,7 @@ Su [photos.google.com](https://photos.google.com) con l'account giusto:
 
 | Opzione | Scelta | Perché |
 |---|---|---|
-| Metodo di consegna | **Invia link per il download via email** | Drive è pieno (15 GB saturi): l'export lì fallirebbe |
+| Metodo di consegna | **Invia link per il download via email** | non richiede spazio aggiuntivo su Drive |
 | Frequenza | **Esporta una volta** | |
 | Tipo di file | **.zip** | |
 | Dimensioni file | **50 GB** | Un account da 15 GB → un solo zip (o pochi) |

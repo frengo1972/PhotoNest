@@ -39,7 +39,7 @@ Chiusa la finestra, il server locale si spegne da solo dopo qualche minuto.
 | Date da verificare | date incoerenti o mancanti, con la spiegazione; correzione sul posto |
 | Cestino | foto escluse dall'archivio, *Rimetti* per recuperarle |
 | Fonti | account e telefoni letti, avanzamento dell'aggiornamento, cartella income |
-| Archivio NAS | destinazione (salvata, per ora `X:\ArchivioFoto`), anteprima di cosa farà, *Crea/Aggiorna l'archivio* |
+| Archivio NAS | destinazione scelta dall'utente (per esempio `X:\ArchivioFoto`), anteprima di cosa farà, *Crea/Aggiorna l'archivio* |
 
 **Azioni** — nessuna tocca gli originali in income; "escludere" significa non copiare nell'archivio finale.
 
