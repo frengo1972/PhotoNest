@@ -1,7 +1,9 @@
-# Photo Consolidator
+# PhotoNest
 
-Tool per consolidare foto e video sparsi su più account Google Photos, telefoni Android e iPhone
-in un **archivio unico, ordinato, per utente**, conservando tutti i metadati (data, GPS, persone, descrizioni, album).
+PhotoNest consolida foto e video provenienti da Google Takeout, telefoni Android e iPhone in un
+**archivio unico, ordinato, per utente**, conservando i metadati (data, GPS, persone, descrizioni e album).
+
+> Progetto locale e privacy-first: gli originali restano intatti e le funzioni AI possono funzionare sul PC.
 
 ## Obiettivo
 
@@ -94,6 +96,15 @@ vengono mai modificati); i modelli AI si scaricano al primo uso in `%LOCALAPPDAT
 | [docs/android.md](docs/android.md) | Copia foto da telefono Android |
 | [docs/iphone.md](docs/iphone.md) | Copia foto da iPhone / iCloud |
 | [income/README.md](income/README.md) | Come organizzare i file in ingresso |
+
+## Roadmap
+
+- [x] Importazione incrementale da Google Takeout, Android e iPhone, con normalizzazione dei metadati.
+- [x] Deduplica, gestione delle varianti, catalogo locale e archivio esportabile su NAS.
+- [x] Galleria locale, ricerca in italiano, persone, eventi, ritocco e descrizioni AI opzionali.
+- [ ] Rendere più semplice la configurazione iniziale e la distribuzione su Windows.
+- [ ] Aggiungere integrazioni e test per altri formati, fonti e modelli locali.
+- [ ] Preparare una guida per contribuire e una licenza open source.
 
 ## Regola d'oro
 
